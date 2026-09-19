@@ -35,6 +35,11 @@ class AudioRenderer(private val telemetry: StreamTelemetry? = null) {
 
     private var loggedFrames = 0
     private var fedFrames = 0L
+    private var codecLabel = "AAC-ELD"
+
+    // PCM pacing state, confined to the worker thread
+    private var pcmFramesWritten = 0L
+    private var droppedLate = 0
 
     var audioEnabled: Boolean = true
         set(value) = synchronized(stateLock) {
@@ -52,22 +57,30 @@ class AudioRenderer(private val telemetry: StreamTelemetry? = null) {
             }
         }
 
-    fun beginSession() = synchronized(stateLock) {
-        if (!closed) {
-            session++
-            active = true
-            loggedFrames = 0
-            fedFrames = 0L
-            frameQueue.clear()
-            telemetry?.onAudioStateChanged(enabled = audioEnabled, active = true)
-            telemetry?.onAudioFormatConfigured("AAC-ELD", SAMPLE_RATE, 2)
-            if (audioEnabled) {
-                worker.execute { setupSession() }
-            }
+    /**
+     * Starts an audio session. Both the mirror lifecycle and the audio-stream lifecycle
+     * call this (a mirroring session has both), so a second call while active is a no-op
+     * apart from refreshing the codec label.
+     */
+    fun beginSession(codec: String = "AAC-ELD") = synchronized(stateLock) {
+        if (closed) return
+        codecLabel = codec
+        telemetry?.onAudioFormatConfigured(codec, SAMPLE_RATE, 2)
+        if (active) return
+        session++
+        active = true
+        loggedFrames = 0
+        fedFrames = 0L
+        droppedLate = 0
+        frameQueue.clear()
+        telemetry?.onAudioStateChanged(enabled = audioEnabled, active = true)
+        if (audioEnabled) {
+            worker.execute { setupSession() }
         }
     }
 
     fun endSession() = synchronized(stateLock) {
+        if (!active && frameQueue.isEmpty()) return
         session++
         active = false
         loggedFrames = 0
@@ -83,8 +96,11 @@ class AudioRenderer(private val telemetry: StreamTelemetry? = null) {
                 Log.i(TAG, "Audio frame #$loggedFrames: size=${data.size}, ct=$ct, ts=$ntpTimestamp")
                 loggedFrames++
             }
-            // Keep at most 30 frames (~320ms) to bound latency and memory
-            if (frameQueue.size >= MAX_QUEUE_SIZE) {
+            // Mirroring audio is played as it arrives, so keep only ~320 ms to bound latency.
+            // Audio-only senders (Music / iTunes) stream about two seconds ahead of the
+            // presentation time and rely on the receiver to hold the packets until then.
+            val limit = if (ct == NativeBridge.CT_PCM) MAX_PCM_QUEUE_SIZE else MAX_QUEUE_SIZE
+            if (frameQueue.size >= limit) {
                 frameQueue.pollFirst()
             }
             frameQueue.addLast(AudioPacket(data, ntpTimestamp, ct))
@@ -100,11 +116,20 @@ class AudioRenderer(private val telemetry: StreamTelemetry? = null) {
         }
     }
 
+    /** Sender paused or seeked (RTSP FLUSH): discard everything queued and buffered. */
     fun flush() = synchronized(stateLock) {
         frameQueue.clear()
         worker.execute {
             runCatching { decoder?.flush() }
-            runCatching { audioTrack?.flush() }
+            audioTrack?.let { track ->
+                // AudioTrack.flush() is a no-op while playing
+                runCatching { track.pause() }
+                runCatching { track.flush() }
+                pcmFramesWritten = 0L
+                if (synchronized(stateLock) { active && !closed && audioEnabled }) {
+                    runCatching { track.play() }
+                }
+            }
         }
     }
 
@@ -129,11 +154,11 @@ class AudioRenderer(private val telemetry: StreamTelemetry? = null) {
         val linear = dbToLinear(synchronized(stateLock) { currentVolumeDb })
         audioTrack?.setVolume(linear)
         if (audioTrack?.playState != AudioTrack.PLAYSTATE_PLAYING) {
+            pcmFramesWritten = 0L
             runCatching { audioTrack?.play() }
         }
-        if (decoder == null) {
-            decoder = createAacDecoder()
-        }
+        // The AAC-ELD decoder is created lazily on the first compressed frame; PCM
+        // (decoded ALAC from Music / iTunes) sessions never need it.
     }
 
     private fun teardownSession() {
@@ -206,13 +231,28 @@ class AudioRenderer(private val telemetry: StreamTelemetry? = null) {
     }
 
     private fun tick() {
-        val (isActive, packet) = synchronized(stateLock) {
-            Pair(active && !closed, frameQueue.pollFirst())
-        }
+        val isActive = synchronized(stateLock) { active && !closed }
         if (!isActive) return
-
-        val currentDecoder = decoder ?: return
         val currentTrack = audioTrack ?: return
+
+        // PCM packets (decoded ALAC) are written straight to the track, paced by their
+        // presentation time; several may fall due in one tick after a sender burst.
+        var pcmBudget = MAX_PCM_WRITES_PER_TICK
+        while (pcmBudget-- > 0) {
+            val head = synchronized(stateLock) { frameQueue.peekFirst() } ?: break
+            if (head.ct != NativeBridge.CT_PCM) break
+            if (!pcmDue(head, currentTrack)) break
+            synchronized(stateLock) { frameQueue.pollFirst() }
+            writePcm(head, currentTrack)
+        }
+
+        val packet = synchronized(stateLock) {
+            if (frameQueue.peekFirst()?.ct == NativeBridge.CT_PCM) null else frameQueue.pollFirst()
+        }
+        if (packet != null && decoder == null) {
+            decoder = createAacDecoder()
+        }
+        val currentDecoder = decoder ?: return
 
         // 1. Submit input frame if available
         if (packet != null) {
@@ -271,7 +311,7 @@ class AudioRenderer(private val telemetry: StreamTelemetry? = null) {
                         Log.i(TAG, "Audio decoder format changed: ${currentDecoder.outputFormat}")
                         val rate = currentDecoder.outputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
                         val channels = currentDecoder.outputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-                        telemetry?.onAudioFormatConfigured("AAC-ELD", rate, channels)
+                        telemetry?.onAudioFormatConfigured(codecLabel, rate, channels)
                         break
                     }
                     else -> break
@@ -282,10 +322,61 @@ class AudioRenderer(private val telemetry: StreamTelemetry? = null) {
         }
     }
 
+    /**
+     * Whether a PCM packet should be written now. [AudioPacket.ntpTimestamp] is the
+     * CLOCK_REALTIME nanosecond presentation time computed by the core from the sender's
+     * sync packets (0 before the first sync). The packet plays once everything already
+     * queued in the track has been consumed, so it is due when that moment is within
+     * [PCM_EARLY_NS] of its presentation time. Packets more than [PCM_LATE_DROP_NS] late
+     * are dropped so playback re-synchronises instead of lagging forever.
+     */
+    private fun pcmDue(packet: AudioPacket, track: AudioTrack): Boolean {
+        val ntp = packet.ntpTimestamp
+        if (ntp <= 0L) return true
+        val nowNs = System.currentTimeMillis() * 1_000_000L
+        val played = track.playbackHeadPosition.toLong() and 0xffffffffL
+        val queuedFrames = (pcmFramesWritten - played).coerceAtLeast(0L)
+        val playAtNs = nowNs + queuedFrames * 1_000_000_000L / SAMPLE_RATE
+        val lead = ntp - playAtNs
+        if (lead > PCM_MAX_PLAUSIBLE_LEAD_NS) return true   // clock disagreement; do not stall
+        return lead <= PCM_EARLY_NS
+    }
+
+    private fun writePcm(packet: AudioPacket, track: AudioTrack) {
+        val ntp = packet.ntpTimestamp
+        if (ntp > 0L) {
+            val late = System.currentTimeMillis() * 1_000_000L - ntp
+            if (late > PCM_LATE_DROP_NS) {
+                if (droppedLate++ % 100 == 0) Log.w(TAG, "Dropping PCM packet ${late / 1_000_000} ms late")
+                return
+            }
+        }
+        try {
+            val written = track.write(packet.data, 0, packet.data.size)
+            if (written > 0) {
+                pcmFramesWritten += written / PCM_FRAME_BYTES
+                fedFrames++
+                telemetry?.onAudioFramePlayed()
+                if (fedFrames % 500 == 0L) {
+                    Log.i(TAG, "Audio PCM frames played: $fedFrames")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error writing PCM: ${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
     internal companion object {
         const val TAG = "WormholeAudio"
         const val SAMPLE_RATE = 44100
         const val MAX_QUEUE_SIZE = 30
+        /** ~4 s of 352-frame ALAC packets: audio-only senders run about 2 s ahead. */
+        const val MAX_PCM_QUEUE_SIZE = 512
+        const val MAX_PCM_WRITES_PER_TICK = 16
+        const val PCM_FRAME_BYTES = 2 * 2   // 16-bit stereo
+        const val PCM_EARLY_NS = 60_000_000L
+        const val PCM_LATE_DROP_NS = 1_000_000_000L
+        const val PCM_MAX_PLAUSIBLE_LEAD_NS = 10_000_000_000L
 
         /** AudioSpecificConfig for AAC-ELD: 44.1 kHz, 2 channels, 480 samples/frame */
         val CSD_AAC_ELD_44100_STEREO_480 = byteArrayOf(

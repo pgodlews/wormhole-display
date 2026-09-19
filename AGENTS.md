@@ -136,9 +136,20 @@ adb logcat | grep -E "uxplay|Wormhole|AndroidRuntime|libc"
   UxPlay upstream. They are protocol values: never rebrand them.
 - **Ports**: RTSP 7000, mirror data TCP 7100, UDP 7011/7001/7101 — set in
   `nativeStart`. The mDNS registration must match.
-- **Audio**: `cb_audio_process` in `wormhole_jni.c` delivers decrypted AAC-ELD
-  frames (`ct=8`, 44.1 kHz, `spf=480`) to `AudioRenderer`. Dropping audio frames
-  is protocol-safe (the core handles resends).
+- **Audio**: `cb_audio_process` in `wormhole_jni.c` delivers decrypted audio to
+  `AudioRenderer`. Mirroring and iOS audio-only are AAC-ELD (`ct=8`, spf 480);
+  legacy RAOP audio (iTunes / older macOS / some Android senders, via `ANNOUNCE`)
+  is ALAC (`ct=2`, spf 352), decoded in-process by `app/src/main/cpp/alac/` to
+  PCM (`ct=0`) before the JNI hop. The negotiated codec/lifetime reach Kotlin via
+  the `audio_running(bool, ct)` callback. Dropping audio frames is protocol-safe
+  (the core handles resends).
+- **Legacy RAOP audio (RSA)**: `rsakey.c` holds the AirPort Express key; `raop.c`
+  answers `Apple-Challenge` and dispatches `ANNOUNCE`; `raop_handlers.h` parses
+  the SDP (RSA-OAEP AES key, ALAC fmtp) and the Transport-header SETUP. The RAOP
+  record advertises `et=0,1 ek=1 am=AirPort4,107`. **Modern macOS Music does not
+  use this path** — it sends FairPlay SAP v2.5 (`fp-setup` version `0x02`), which
+  playfair cannot answer and no open code implements; see `docs/uxplay-patches.md`.
+  Do not spend time trying to make macOS Music audio work from the receiver.
 - **H.265**: optional experimental dashboard setting (off by default). Bit 42 is
   advertised only when `VideoDecoderSupport` finds a hardware HEVC decoder for
   the advertised size/rate. JNI carries the codec on each frame; `VideoFrameQueue`

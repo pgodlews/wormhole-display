@@ -36,6 +36,7 @@ Wormhole Display is an independent community project and is not affiliated with 
 - **Portrait & Landscape orientation**: choose between Landscape (widescreen), Portrait (tall), or Auto-detect. On rotatable hardware (like Portal Mini), **Auto** mode uses the device's tilt sensor to automatically flip the advertised AirPlay geometry when you physically rotate the display. Fixed-stand models (Portal TV, Portal Go, Portal+ Gen 2) default to Landscape, with manual Portrait selection available.
 - **Hardware video decoding**: H.264 on the Portal's hardware decoder, with experimental HEVC for senders that support it.
 - **Sound through the Portal**: audio plays on the Portal's speakers and can be muted from the dashboard.
+- **AirPlay speaker (audio-only)**: play music straight to the Portal from an **iPhone or iPad** (Control Center → AirPlay, or the AirPlay button in Apple Music, Podcasts, etc.), without mirroring. ALAC is decoded on-device.
 - **Opens when you connect**: the receiver stays available in the background and brings itself full screen when a stream starts. It can also start when the Portal boots.
 - **Back or Home to disconnect**: leaving the stream on the Portal ends the session on your Mac or iPhone too.
 - **Several Portals, one network**: each device has its own identity, so a Portal+ and a Portal TV can both be available at once.

@@ -38,6 +38,10 @@ object WormholeServer {
     private val _clientName = MutableStateFlow<String?>(null)
     val clientName: StateFlow<String?> = _clientName.asStateFlow()
 
+    /** An audio-only AirPlay session (Music / iTunes, iOS audio) is playing through the speakers. */
+    private val _isAudioStreaming = MutableStateFlow(false)
+    val isAudioStreaming: StateFlow<Boolean> = _isAudioStreaming.asStateFlow()
+
     private val _statusText = MutableStateFlow("Starting receiver…")
     val statusText: StateFlow<String> = _statusText.asStateFlow()
 
@@ -90,6 +94,7 @@ object WormholeServer {
     private var sessionClientName: String? = null
     private var sessionResolution: String = ""
     private var sessionCodec: String = ""
+    private var audioSessionStartTime = 0L
 
     // Renderers
     val renderer = VideoRenderer(
@@ -124,7 +129,7 @@ object WormholeServer {
     private val mirrorGeneration = AtomicLong()
 
     val idleStatus: String
-        get() = "Visible in Screen Mirroring as “${identity.serviceName}”"
+        get() = "Visible in Screen Mirroring and as an AirPlay speaker as “${identity.serviceName}”"
 
     @Synchronized
     fun init(context: Context) {
@@ -312,6 +317,7 @@ object WormholeServer {
         lease?.let { serverLifecycle.stop(it) }
         lease = null
         _isMirroring.value = false
+        _isAudioStreaming.value = false
         _clientName.value = null
         _statusText.value = "Receiver stopped"
     }
@@ -324,6 +330,7 @@ object WormholeServer {
             audioRenderer.endSession()
             mirrorGeneration.incrementAndGet()
             _isMirroring.value = false
+            _isAudioStreaming.value = false
             _videoAspectRatio.value = null
             _clientName.value = null
             _statusText.value = "Restarting receiver…"
@@ -335,7 +342,7 @@ object WormholeServer {
 
     /** The user left the stream on the device (Back/Home): drop the sender by restarting the receiver. */
     fun disconnectClient(reason: String) {
-        if (!_isMirroring.value) return
+        if (!_isMirroring.value && !_isAudioStreaming.value) return
         Log.i("Wormhole", "Disconnecting client: $reason")
         restartServer()
     }
@@ -347,6 +354,7 @@ object WormholeServer {
         audioRenderer.endSession()
         mirrorGeneration.incrementAndGet()
         _isMirroring.value = false
+        _isAudioStreaming.value = false
         _videoAspectRatio.value = null
         _clientName.value = null
         _statusText.value = "Stream interrupted — reconnect from Screen Mirroring"
@@ -398,6 +406,46 @@ object WormholeServer {
             // Socket close is diagnostic only
         }
 
+        override fun onAudioRunning(running: Boolean, ct: Int) {
+            if (!callbacksEnabled.get()) return
+            val codec = when (ct) {
+                NativeBridge.CT_ALAC -> "ALAC"
+                NativeBridge.CT_AAC_ELD -> "AAC-ELD"
+                else -> "ct=$ct"
+            }
+            if (running) {
+                audioRenderer.beginSession(codec)
+                // Audio arriving outside a mirroring session is an AirPlay speaker session
+                // (Music / iTunes on a Mac, or iOS audio-only). Mirroring owns the UI otherwise.
+                if (!_isMirroring.value) {
+                    audioSessionStartTime = System.currentTimeMillis()
+                    _isAudioStreaming.value = true
+                    _statusText.value = "Playing audio from ${_clientName.value ?: "AirPlay"}"
+                    Log.i(TAG, "Audio-only session started ($codec)")
+                }
+            } else {
+                if (_isAudioStreaming.value) {
+                    if (audioSessionStartTime > 0L) {
+                        val duration = (System.currentTimeMillis() - audioSessionStartTime) / 1000
+                        history.recordConnection(
+                            sessionClientName ?: _clientName.value ?: "AirPlay audio",
+                            audioSessionStartTime, duration, "Audio only", codec
+                        )
+                        _recentConnections.value = history.getRecent()
+                    }
+                    audioSessionStartTime = 0L
+                    _isAudioStreaming.value = false
+                    sessionClientName = null
+                    _clientName.value = null
+                    _statusText.value = idleStatus
+                    Log.i(TAG, "Audio-only session ended")
+                }
+                if (!_isMirroring.value) {
+                    audioRenderer.endSession()
+                }
+            }
+        }
+
         override fun onMirrorRunning(running: Boolean) {
             if (!callbacksEnabled.get()) return
             if (running) {
@@ -417,6 +465,7 @@ object WormholeServer {
             if (event == mirrorGeneration.get()) {
                 _isMirroring.value = running
                 if (running) {
+                    _isAudioStreaming.value = false
                     _statusText.value = "Mirroring ${_clientName.value ?: "client"}"
                     if (!isActivityResumed) {
                         onIncomingStreamBackgroundCallback?.invoke()

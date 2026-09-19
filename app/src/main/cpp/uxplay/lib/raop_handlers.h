@@ -581,12 +581,209 @@ raop_handler_fpsetup(raop_conn_t *conn,
     }
 }
 
+/* Android port: legacy RAOP ("AirTunes") audio announcement from iTunes / macOS Music.
+ * The body is SDP text:
+ *   a=rtpmap:96 AppleLossless
+ *   a=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100
+ *   a=rsaaeskey:<base64 RSA-OAEP(AES key)>
+ *   a=aesiv:<base64 16-byte IV>
+ * Everything needed for the later Transport-header SETUP is stashed on the connection. */
+static const char *
+sdp_attribute(const char *sdp, int sdp_len, const char *name, int *value_len)
+{
+    size_t name_len = strlen(name);
+    const char *p = sdp;
+    const char *end = sdp + sdp_len;
+    while (p < end) {
+        const char *eol = memchr(p, '\n', (size_t) (end - p));
+        size_t line_len = eol ? (size_t) (eol - p) : (size_t) (end - p);
+        if (line_len > 2 + name_len + 1 && p[0] == 'a' && p[1] == '=' &&
+            !strncmp(p + 2, name, name_len) && p[2 + name_len] == ':') {
+            const char *v = p + 2 + name_len + 1;
+            size_t v_len = line_len - (2 + name_len + 1);
+            while (v_len && (v[v_len - 1] == '\r' || v[v_len - 1] == ' ')) v_len--;
+            *value_len = (int) v_len;
+            return v;
+        }
+        if (!eol) break;
+        p = eol + 1;
+    }
+    return NULL;
+}
+
+static void
+raop_handler_announce(raop_conn_t *conn,
+                      http_request_t *request, http_response_t *response,
+                      char **response_data, int *response_datalen)
+{
+    raop_t *raop = conn->raop;
+    int data_len = 0;
+    const char *data = http_request_get_data(request, &data_len);
+    const char *content_type = http_request_get_header(request, "Content-Type");
+
+    if (!data || data_len <= 0 || !content_type || strcmp(content_type, "application/sdp")) {
+        logger_log(raop->logger, LOGGER_ERR, "ANNOUNCE without an SDP body");
+        http_response_init(response, "RTSP/1.0", 415, "Unsupported Media Type");
+        return;
+    }
+
+    int len = 0;
+    const char *rtpmap = sdp_attribute(data, data_len, "rtpmap", &len);
+    if (!rtpmap || !strstr(rtpmap, "AppleLossless")) {
+        logger_log(raop->logger, LOGGER_ERR, "ANNOUNCE: only AppleLossless (ALAC) audio is supported: %.*s",
+                   rtpmap ? len : 0, rtpmap ? rtpmap : "");
+        http_response_init(response, "RTSP/1.0", 415, "Unsupported Media Type");
+        return;
+    }
+
+    /* Defaults are the values every AirPlay sender uses for 44.1 kHz 16-bit stereo ALAC */
+    static const unsigned int default_fmtp[12] = { 96, 352, 0, 16, 40, 10, 14, 2, 255, 0, 0, 44100 };
+    memcpy(conn->legacy_fmtp, default_fmtp, sizeof(default_fmtp));
+    const char *fmtp = sdp_attribute(data, data_len, "fmtp", &len);
+    if (fmtp) {
+        char buf[128] = { 0 };
+        memcpy(buf, fmtp, (size_t) (len < (int) sizeof(buf) - 1 ? len : (int) sizeof(buf) - 1));
+        char *save = NULL;
+        int i = 0;
+        for (char *tok = strtok_r(buf, " \t", &save); tok && i < 12; tok = strtok_r(NULL, " \t", &save)) {
+            conn->legacy_fmtp[i++] = (unsigned int) strtoul(tok, NULL, 10);
+        }
+    }
+    if (conn->legacy_fmtp[3] != 16 || conn->legacy_fmtp[7] != 2 || conn->legacy_fmtp[11] != 44100) {
+        logger_log(raop->logger, LOGGER_WARNING, "ANNOUNCE: unusual ALAC format %u-bit %u ch %u Hz (expected 16/2/44100)",
+                   conn->legacy_fmtp[3], conn->legacy_fmtp[7], conn->legacy_fmtp[11]);
+    }
+
+    int iv_len = 0, key_len = 0;
+    const char *aesiv = sdp_attribute(data, data_len, "aesiv", &iv_len);
+    const char *rsaaeskey = sdp_attribute(data, data_len, "rsaaeskey", &key_len);
+    conn->legacy_encrypted = false;
+    if (aesiv && rsaaeskey) {
+        if (!raop->rsakey) {
+            logger_log(raop->logger, LOGGER_ERR, "ANNOUNCE: encrypted session requested but RSA key unavailable");
+            http_response_init(response, "RTSP/1.0", 456, "Header Field Not Valid for Resource");
+            return;
+        }
+        char *iv_b64 = strndup(aesiv, (size_t) iv_len);
+        char *key_b64 = strndup(rsaaeskey, (size_t) key_len);
+        int decoded_len = 0;
+        unsigned char *iv = iv_b64 ? rsakey_base64_decode(iv_b64, &decoded_len) : NULL;
+        int key_ok = key_b64 ? rsakey_decrypt_aeskey(raop->rsakey, key_b64, conn->legacy_aeskey) : -1;
+        if (iv && decoded_len == 16 && key_ok == 0) {
+            memcpy(conn->legacy_aesiv, iv, 16);
+            conn->legacy_encrypted = true;
+        } else {
+            logger_log(raop->logger, LOGGER_ERR, "ANNOUNCE: bad aesiv (%d bytes) or rsaaeskey (rc %d)", decoded_len, key_ok);
+        }
+        free(iv);
+        free(iv_b64);
+        free(key_b64);
+        if (!conn->legacy_encrypted) {
+            http_response_init(response, "RTSP/1.0", 456, "Header Field Not Valid for Resource");
+            return;
+        }
+    } else if (aesiv || rsaaeskey) {
+        logger_log(raop->logger, LOGGER_ERR, "ANNOUNCE: missing aesiv or rsaaeskey");
+        http_response_init(response, "RTSP/1.0", 456, "Header Field Not Valid for Resource");
+        return;
+    }
+    conn->legacy_audio = true;
+
+    /* Identify the sender for the UI; iTunes sends X-Apple-Client-Name, otherwise
+     * fall back to the product part of the User-Agent ("Music/1.6.6 (...)" -> "Music"). */
+    char name[64] = "AirPlay audio";
+    const char *client_name = http_request_get_header(request, "X-Apple-Client-Name");
+    const char *user_agent = http_request_get_header(request, "User-Agent");
+    if (client_name && *client_name) {
+        snprintf(name, sizeof(name), "%s", client_name);
+    } else if (user_agent && *user_agent) {
+        size_t n = strcspn(user_agent, "/ ");
+        snprintf(name, sizeof(name), "%.*s", (int) (n < sizeof(name) - 1 ? n : sizeof(name) - 1), user_agent);
+    }
+    logger_log(raop->logger, LOGGER_INFO, "legacy RAOP audio (ALAC, %s) announced by %s [%s]",
+               conn->legacy_encrypted ? "AES encrypted" : "unencrypted", name, user_agent ? user_agent : "?");
+    if (raop->callbacks.report_client_request) {
+        bool admit = true;
+        raop->callbacks.report_client_request(raop->callbacks.cls, NULL, NULL, name, &admit);
+        if (!admit) {
+            http_response_init(response, "RTSP/1.0", 403, "Forbidden");
+            conn->legacy_audio = false;
+        }
+    }
+}
+
+/* Android port: legacy RAOP SETUP ("Transport: RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;
+ * control_port=N;timing_port=M"). Reuses the NTP timing and RTP audio machinery of the
+ * plist SETUP; only the key exchange and the port negotiation differ. */
+static void
+raop_handler_setup_legacy(raop_conn_t *conn, http_request_t *request, http_response_t *response,
+                          const char *transport)
+{
+    raop_t *raop = conn->raop;
+    unsigned short remote_cport = 0, timing_rport = 0;
+    const char *p = strstr(transport, "control_port=");
+    if (p) remote_cport = (unsigned short) strtoul(p + strlen("control_port="), NULL, 10);
+    p = strstr(transport, "timing_port=");
+    if (p) timing_rport = (unsigned short) strtoul(p + strlen("timing_port="), NULL, 10);
+    logger_log(raop->logger, LOGGER_DEBUG, "legacy SETUP: client control_port=%u timing_port=%u",
+               remote_cport, timing_rport);
+
+    if (conn->raop_rtp) {
+        logger_log(raop->logger, LOGGER_WARNING, "duplicate legacy SETUP; tearing down previous audio session");
+        raop_rtp_destroy(conn->raop_rtp);
+        conn->raop_rtp = NULL;
+    }
+    if (conn->raop_ntp) {
+        raop_ntp_destroy(conn->raop_ntp);
+        conn->raop_ntp = NULL;
+    }
+
+    char remote[40] = { 0 };
+    int len = utils_ipaddress_to_string(conn->remotelen, conn->remote, conn->zone_id, remote, (int) sizeof(remote));
+    if (!len || len > (int) sizeof(remote)) {
+        logger_log(raop->logger, LOGGER_ERR, "legacy SETUP: failed to extract client ip address");
+    }
+    /* iTunes answers the same NTP-style timing requests as AirPlay 1 mirroring senders */
+    timing_protocol_t time_protocol = TP_UNSPECIFIED;
+    unsigned short timing_lport = raop->timing_lport;
+    conn->raop_ntp = raop_ntp_init(raop->logger, &raop->callbacks, remote, conn->remotelen, timing_rport, &time_protocol);
+    raop_ntp_start(conn->raop_ntp, &timing_lport);
+    conn->raop_rtp = raop_rtp_init(raop->logger, &raop->callbacks, conn->raop_ntp, remote, conn->remotelen,
+                                   conn->legacy_encrypted ? conn->legacy_aeskey : NULL,
+                                   conn->legacy_encrypted ? conn->legacy_aesiv : NULL);
+    if (!conn->raop_rtp) {
+        logger_log(raop->logger, LOGGER_ERR, "legacy SETUP: RAOP audio init failed");
+        http_response_init(response, "RTSP/1.0", 500, "Internal Server Error");
+        return;
+    }
+
+    unsigned char ct = 2;   /* ALAC */
+    unsigned short spf = (unsigned short) conn->legacy_fmtp[1];
+    unsigned int sr = conn->legacy_fmtp[11] ? conn->legacy_fmtp[11] : AUDIO_SAMPLE_RATE;
+    if (raop->callbacks.audio_get_format) {
+        bool using_screen = false, is_media = true;
+        uint64_t audio_format = 0;
+        raop->callbacks.audio_get_format(raop->callbacks.cls, &ct, &spf, &using_screen, &is_media, &audio_format);
+    }
+    unsigned short cport = raop->control_lport, dport = raop->data_lport;
+    raop_rtp_start_audio(conn->raop_rtp, &remote_cport, &cport, &dport, &ct, &sr);
+
+    char transport_response[160];
+    snprintf(transport_response, sizeof(transport_response),
+             "RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port=%u;timing_port=%u;server_port=%u",
+             cport, timing_lport, dport);
+    http_response_add_header(response, "Transport", transport_response);
+    http_response_add_header(response, "Session", "1");
+    logger_log(raop->logger, LOGGER_INFO, "legacy RAOP audio session: data %u, control %u, timing %u",
+               dport, cport, timing_lport);
+}
+
 static void
 raop_handler_options(raop_conn_t *conn,
                      http_request_t *request, http_response_t *response,
                      char **response_data, int *response_datalen)
 {
-    http_response_add_header(response, "Public", "SETUP, RECORD, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER");
+    http_response_add_header(response, "Public", "ANNOUNCE, SETUP, RECORD, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER");
 }
 
 static void
@@ -612,6 +809,13 @@ raop_handler_setup(raop_conn_t *conn,
         if (conn->raop_rtp) {
             raop_rtp_remote_control_id(conn->raop_rtp, dacp_id, active_remote_header);
         }
+    }
+
+    /* Android port: legacy RAOP (after ANNOUNCE) negotiates ports in a Transport header, no plist */
+    const char *transport = http_request_get_header(request, "Transport");
+    if (conn->legacy_audio && transport) {
+        raop_handler_setup_legacy(conn, request, response, transport);
+        return;
     }
 
     // Parsing bplist

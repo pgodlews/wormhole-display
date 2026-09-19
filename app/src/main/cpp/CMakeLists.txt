@@ -24,8 +24,13 @@ target_compile_definitions(mirror-core PRIVATE
     OPENSSL_API_COMPAT=0x10101000L)
 target_compile_options(mirror-core PRIVATE -w)
 
+# Clean-room ALAC decoder (GPLv3, part of this project): Portal has no MediaCodec ALAC.
+add_library(alac-decoder STATIC ${CMAKE_CURRENT_SOURCE_DIR}/alac/alac_decoder.c)
+target_include_directories(alac-decoder PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/alac)
+
 add_library(wormhole SHARED wormhole_jni.c)
 target_link_libraries(wormhole
+    alac-decoder
     mirror-core
     ${DEPS}/plist/lib/${ANDROID_ABI}/libplist-2.0.a
     ${DEPS}/openssl/lib/${ANDROID_ABI}/libcrypto.a

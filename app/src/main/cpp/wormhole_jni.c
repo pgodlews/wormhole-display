@@ -11,6 +11,7 @@
 #include "raop.h"
 #include "stream.h"
 #include "logger.h"
+#include "alac_decoder.h"
 
 #define TAG "Wormhole"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -22,12 +23,26 @@ static jobject g_listener;                          /* guarded by g_listener_loc
 static pthread_mutex_t g_listener_lock = PTHREAD_MUTEX_INITIALIZER;
 static jmethodID g_on_video_frame, g_on_audio_frame, g_on_audio_volume, g_on_audio_flush,
                  g_on_client_connected, g_on_client_disconnected,
-                 g_on_mirror_running, g_on_stream_error;
+                 g_on_mirror_running, g_on_audio_running, g_on_stream_error;
 static raop_t *g_raop;                              /* guarded by g_lock */
 static dnssd_t *g_dnssd;                            /* guarded by g_lock */
 static bool g_allow_hevc;                           /* immutable while server workers run */
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_key_t g_tls_key;                     /* set on threads this shim attached */
+
+/* Audio codec negotiated by the current session (AirPlay "ct": 2 = ALAC, 8 = AAC-ELD).
+ * ALAC (Music / iTunes audio-only, iOS audio-only) is decoded here because the
+ * Portal has no MediaCodec ALAC decoder; Kotlin receives PCM tagged AUDIO_CT_PCM. */
+#define AUDIO_CT_PCM 0
+#define AUDIO_CT_ALAC 2
+#define AUDIO_CT_AAC_ELD 8
+static pthread_mutex_t g_audio_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_audio_ct = AUDIO_CT_AAC_ELD;            /* guarded by g_audio_lock */
+static unsigned short g_audio_spf = 480;             /* guarded by g_audio_lock */
+static alac_decoder_t *g_alac;                       /* guarded by g_audio_lock */
+static int16_t *g_pcm;                               /* guarded by g_audio_lock */
+static size_t g_pcm_samples;                         /* guarded by g_audio_lock */
+static int g_alac_errors;                            /* guarded by g_audio_lock */
 
 /* Threads attached by env_for_thread must be detached before they exit,
  * otherwise the JVM retains per-thread resources (the core creates and
@@ -106,18 +121,41 @@ static void cb_video_process(void *cls, raop_ntp_t *ntp, video_decode_struct *da
 
 static void cb_audio_process(void *cls, raop_ntp_t *ntp, audio_decode_struct *data) {
     if (!data || !data->data || data->data_len <= 0) return;
+    const void *payload = data->data;
+    int payload_len = data->data_len;
+    int ct = data->ct;
+
+    pthread_mutex_lock(&g_audio_lock);
+    if (ct == AUDIO_CT_ALAC) {
+        if (!g_alac || !g_pcm) {
+            pthread_mutex_unlock(&g_audio_lock);
+            return;
+        }
+        int frames = alac_decoder_decode(g_alac, (const uint8_t *) data->data, (size_t) data->data_len, g_pcm, g_pcm_samples);
+        if (frames <= 0) {
+            if (g_alac_errors++ < 5) LOGW("ALAC decode failed (%d) on a %d byte packet", frames, data->data_len);
+            pthread_mutex_unlock(&g_audio_lock);
+            return;
+        }
+        payload = g_pcm;
+        payload_len = frames * alac_decoder_channels(g_alac) * (int) sizeof(int16_t);
+        ct = AUDIO_CT_PCM;
+    }
+
     JNIEnv *env = env_for_thread();
-    if (!env) return;
+    if (!env) { pthread_mutex_unlock(&g_audio_lock); return; }
     jobject listener = listener_snapshot(env);
-    if (!listener) return;
-    jbyteArray frame = (*env)->NewByteArray(env, data->data_len);
+    if (!listener) { pthread_mutex_unlock(&g_audio_lock); return; }
+    jbyteArray frame = (*env)->NewByteArray(env, payload_len);
     if (!frame) {
+        pthread_mutex_unlock(&g_audio_lock);
         (*env)->ExceptionClear(env);
         (*env)->DeleteLocalRef(env, listener);
         return;
     }
-    (*env)->SetByteArrayRegion(env, frame, 0, data->data_len, (const jbyte *) data->data);
-    (*env)->CallVoidMethod(env, listener, g_on_audio_frame, frame, (jlong) data->ntp_time_local, (jint) data->ct);
+    (*env)->SetByteArrayRegion(env, frame, 0, payload_len, (const jbyte *) payload);
+    pthread_mutex_unlock(&g_audio_lock);   /* g_pcm has been copied out */
+    (*env)->CallVoidMethod(env, listener, g_on_audio_frame, frame, (jlong) data->ntp_time_local, (jint) ct);
     (*env)->DeleteLocalRef(env, frame);
     (*env)->DeleteLocalRef(env, listener);
     if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); }
@@ -200,14 +238,59 @@ static void cb_audio_set_volume(void *cls, float v) {
 static void cb_audio_set_data(void *cls, const void *b, int l) {}
 static void cb_audio_remote_control(void *cls, const char *a, const char *b) {}
 static void cb_audio_set_progress(void *cls, uint32_t *s, uint32_t *c, uint32_t *e) {}
+/* The core reports the format the client negotiated in SETUP; it must not be
+ * overridden (an earlier version forced AAC-ELD here, which broke ALAC sessions).
+ * Mirroring sends AAC-ELD (ct=8, spf=480); Music / iTunes and iOS audio-only send
+ * ALAC (ct=2, spf=352). */
 static void cb_audio_get_format(void *cls, unsigned char *ct, unsigned short *spf,
                                 bool *usingScreen, bool *isMedia, uint64_t *audioFormat) {
-    LOGI("cb_audio_get_format: client requested ct=%u, spf=%u", ct ? *ct : 0, spf ? *spf : 0);
-    if (ct) *ct = 8;     /* AAC-ELD for low-latency screen mirroring */
-    if (spf) *spf = 480;  /* 480 samples per frame at 44.1 kHz */
-    if (usingScreen) *usingScreen = true;
-    if (isMedia) *isMedia = false;
-    if (audioFormat) *audioFormat = 0;
+    LOGI("audio format: ct=%u spf=%u usingScreen=%d isMedia=%d audioFormat=0x%llx",
+         ct ? *ct : 0, spf ? *spf : 0, usingScreen ? *usingScreen : 0, isMedia ? *isMedia : 0,
+         audioFormat ? (unsigned long long) *audioFormat : 0ULL);
+    pthread_mutex_lock(&g_audio_lock);
+    g_audio_ct = ct ? *ct : AUDIO_CT_AAC_ELD;
+    g_audio_spf = (spf && *spf) ? *spf : (g_audio_ct == AUDIO_CT_ALAC ? 352 : 480);
+    pthread_mutex_unlock(&g_audio_lock);
+}
+
+static void audio_decoder_release_locked(void) {
+    alac_decoder_destroy(g_alac);
+    g_alac = NULL;
+    free(g_pcm);
+    g_pcm = NULL;
+    g_pcm_samples = 0;
+}
+
+/* Verified audio RTP thread lifetime (the audio analogue of cb_mirror_video_running).
+ * Fires for the audio stream of a mirroring session as well as for audio-only
+ * sessions; the Kotlin side keys the audio renderer's session state off it. */
+static void cb_audio_running(void *cls, bool running) {
+    int ct;
+    pthread_mutex_lock(&g_audio_lock);
+    ct = g_audio_ct;
+    audio_decoder_release_locked();
+    g_alac_errors = 0;
+    if (running && ct == AUDIO_CT_ALAC) {
+        /* AirPlay ALAC is always 16-bit stereo 44.1 kHz; the frame length comes from SETUP / fmtp */
+        unsigned int fmtp[12] = { 96, g_audio_spf, 0, 16, 40, 10, 14, 2, 255, 0, 0, 44100 };
+        g_alac = alac_decoder_create(fmtp);
+        if (g_alac) {
+            g_pcm_samples = (size_t) g_audio_spf * 2;
+            g_pcm = malloc(g_pcm_samples * sizeof(int16_t));
+            if (!g_pcm) audio_decoder_release_locked();
+        }
+        if (!g_alac) LOGE("ALAC decoder init failed (spf=%u); audio will be silent", g_audio_spf);
+    }
+    pthread_mutex_unlock(&g_audio_lock);
+    LOGI("audio stream %s (ct=%d)", running ? "started" : "stopped", ct);
+
+    JNIEnv *env = env_for_thread();
+    if (!env) return;
+    jobject listener = listener_snapshot(env);
+    if (!listener) return;
+    (*env)->CallVoidMethod(env, listener, g_on_audio_running, running ? JNI_TRUE : JNI_FALSE, (jint) ct);
+    (*env)->DeleteLocalRef(env, listener);
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); }
 }
 static void cb_register_client(void *cls, const char *id, const char *pk, const char *name) {}
 static bool cb_check_register(void *cls, const char *pk) { return false; }
@@ -235,10 +318,11 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
     g_on_client_connected = (*env)->GetMethodID(env, cls, "onClientConnected", "(Ljava/lang/String;)V");
     g_on_client_disconnected = (*env)->GetMethodID(env, cls, "onClientDisconnected", "()V");
     g_on_mirror_running = (*env)->GetMethodID(env, cls, "onMirrorRunning", "(Z)V");
+    g_on_audio_running = (*env)->GetMethodID(env, cls, "onAudioRunning", "(ZI)V");
     g_on_stream_error = (*env)->GetMethodID(env, cls, "onStreamError", "()V");
     return (g_on_video_frame && g_on_audio_frame && g_on_audio_volume && g_on_audio_flush
             && g_on_client_connected && g_on_client_disconnected
-            && g_on_mirror_running && g_on_stream_error) ? JNI_VERSION_1_6 : JNI_ERR;
+            && g_on_mirror_running && g_on_audio_running && g_on_stream_error) ? JNI_VERSION_1_6 : JNI_ERR;
 }
 
 JNIEXPORT void Java_io_github_pgodlews_wormhole_NativeBridge_nativeSetListener(JNIEnv *env, jclass cls, jobject listener) {
@@ -280,6 +364,7 @@ JNIEXPORT jint Java_io_github_pgodlews_wormhole_NativeBridge_nativeStart(JNIEnv 
     callbacks.audio_remote_control_id = cb_audio_remote_control;
     callbacks.audio_set_progress = cb_audio_set_progress;
     callbacks.audio_get_format = cb_audio_get_format;
+    callbacks.audio_running = cb_audio_running;
     callbacks.video_report_size = cb_video_report_size;
     callbacks.mirror_video_running = cb_mirror_video_running;
     callbacks.report_client_request = cb_report_client_request;
@@ -403,5 +488,8 @@ JNIEXPORT void Java_io_github_pgodlews_wormhole_NativeBridge_nativeStop(JNIEnv *
         raop_destroy(g_raop);  /* owns the pk string dnssd pointed at; freed last */
         g_raop = NULL;
     }
+    pthread_mutex_lock(&g_audio_lock);
+    audio_decoder_release_locked();   /* no RTP thread can call cb_audio_process past raop_destroy */
+    pthread_mutex_unlock(&g_audio_lock);
     pthread_mutex_unlock(&g_lock);
 }

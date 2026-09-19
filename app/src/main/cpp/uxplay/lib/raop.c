@@ -31,6 +31,7 @@
 #include "compat.h"
 #include "raop_rtp_mirror.h"
 #include "raop_ntp.h"
+#include "rsakey.h"  /* Android port: legacy RAOP (iTunes/Music) RSA */
 
 
 /* libplist-2.3.0  API change */
@@ -52,6 +53,7 @@ struct raop_s {
     /* Pairing, HTTP daemon and RSA key */
     pairing_t *pairing;
     httpd_t *httpd;
+    rsakey_t *rsakey;   /* Android port: AirPort Express key for legacy RAOP audio clients */
 
     dnssd_t *dnssd;
 
@@ -121,6 +123,16 @@ struct raop_conn_s {
     char *client_session_id;
     bool authenticated;
     bool have_active_remote;
+
+    /* Android port: legacy RAOP ("AirTunes") audio session negotiated by ANNOUNCE
+     * (iTunes / macOS Music). The AES key arrives RSA-encrypted in the SDP instead
+     * of FairPlay-wrapped in a SETUP plist, and SETUP carries ports in a Transport
+     * header instead of a plist. */
+    bool legacy_audio;
+    bool legacy_encrypted;
+    unsigned char legacy_aeskey[16];
+    unsigned char legacy_aesiv[16];
+    unsigned int legacy_fmtp[12];
 };
 typedef struct raop_conn_s raop_conn_t;
 
@@ -339,6 +351,24 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
 	    http_response_add_header(*response, "Audio-Jack-Status", "connected; type=digital");
     }
 
+    /* Android port: legacy RAOP clients (iTunes / macOS Music) verify the receiver with
+     * an Apple-Challenge header, usually on OPTIONS; they refuse to stream without a
+     * valid Apple-Response signed by the AirPort Express key. */
+    const char *apple_challenge = http_request_get_header(request, "Apple-Challenge");
+    if (apple_challenge && raop->rsakey) {
+        int hwaddr_len = 0;
+        const char *hwaddr = raop->dnssd ? dnssd_get_hw_addr(raop->dnssd, &hwaddr_len) : NULL;
+        char *apple_response = rsakey_sign_challenge(raop->rsakey, apple_challenge,
+                                                     conn->local, conn->locallen,
+                                                     (const unsigned char *) hwaddr, hwaddr_len);
+        if (apple_response) {
+            http_response_add_header(*response, "Apple-Response", apple_response);
+            free(apple_response);
+        } else {
+            logger_log(raop->logger, LOGGER_WARNING, "failed to answer Apple-Challenge");
+        }
+    }
+
     if (!conn->have_active_remote) {
         const char *active_remote = http_request_get_header(request, "Active-Remote");
         if (active_remote) {
@@ -424,6 +454,8 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
             if (strstr(url, "/info")) {
                 handler = &raop_handler_info;
             }
+        } else if (!strcmp(method, "ANNOUNCE")) {
+            handler = &raop_handler_announce;   /* Android port: legacy RAOP audio */
         } else if (!strcmp(method, "OPTIONS")) {
             handler = &raop_handler_options;
         } else if (!strcmp(method, "SETUP")) {
@@ -693,6 +725,11 @@ raop_init2(raop_t *raop, int nohold, const char *device_id, const char *keyfile)
     }
 
     raop->pairing = pairing;
+    /* Android port: legacy RAOP clients need the AirPort Express RSA key */
+    raop->rsakey = rsakey_init();
+    if (!raop->rsakey) {
+        logger_log(raop->logger, LOGGER_WARNING, "RSA key init failed: iTunes/Music audio-only streaming disabled");
+    }
     raop->httpd = httpd;
     return 0;
 }
@@ -703,6 +740,7 @@ raop_destroy(raop_t *raop) {
         raop_destroy_airplay_video(raop, -1);
         raop_stop_httpd(raop);
         pairing_destroy(raop->pairing);
+        rsakey_destroy(raop->rsakey);   /* Android port */
         httpd_destroy(raop->httpd);
         logger_destroy(raop->logger);
         if (raop->nonce) {

@@ -131,9 +131,10 @@ static int dnssd_build_raop_txt(dnssd_t *dnssd_public)
            mdnsd_txt_add(&dnssd->raop_record, "cn", RAOP_CN) ||
            mdnsd_txt_add(&dnssd->raop_record, "da", RAOP_DA) ||
            mdnsd_txt_add(&dnssd->raop_record, "et", RAOP_ET) ||
+           mdnsd_txt_add(&dnssd->raop_record, "ek", RAOP_EK) ||   /* Android port: legacy RAOP RSA */
            mdnsd_txt_add(&dnssd->raop_record, "vv", RAOP_VV) ||
            mdnsd_txt_add(&dnssd->raop_record, "ft", features) ||
-           mdnsd_txt_add(&dnssd->raop_record, "am", GLOBAL_MODEL) ||
+           mdnsd_txt_add(&dnssd->raop_record, "am", GLOBAL_RAOP_MODEL) ||   /* Android port: route macOS Music to RSA */
            mdnsd_txt_add(&dnssd->raop_record, "md", RAOP_MD) ||
            mdnsd_txt_add(&dnssd->raop_record, "rhd", RAOP_RHD) ||
            mdnsd_txt_add(&dnssd->raop_record, "pw", pw) ||

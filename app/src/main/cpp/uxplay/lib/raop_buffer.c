@@ -69,15 +69,14 @@ raop_buffer_init(logger_t *logger,
                  const unsigned char *aeskey,
                  const unsigned char *aesiv)
 {
-    assert(aeskey);
-    assert(aesiv);
     raop_buffer_t *raop_buffer = (raop_buffer_t *) calloc(1, sizeof(raop_buffer_t));
     if (!raop_buffer) {
         return NULL;
     }
     raop_buffer->logger = logger;
     // Need to be initialized internally
-    raop_buffer->aes_ctx = aes_cbc_init(aeskey, aesiv, AES_DECRYPT);
+    /* Android port: a NULL key means an unencrypted legacy RAOP session (ANNOUNCE without rsaaeskey) */
+    raop_buffer->aes_ctx = (aeskey && aesiv) ? aes_cbc_init(aeskey, aesiv, AES_DECRYPT) : NULL;
 
     for (int i = 0; i < RAOP_BUFFER_LENGTH; i++) {
         raop_buffer_entry_t *entry = &raop_buffer->entries[i];
@@ -127,11 +126,13 @@ raop_buffer_decrypt(raop_buffer_t *raop_buffer, unsigned char *data, unsigned ch
             free(str);
         }
     }
-    int encryptedlen = payload_size / 16*16;
+    int encryptedlen = raop_buffer->aes_ctx ? payload_size / 16*16 : 0;   /* Android port: unencrypted legacy session */
     memset(output, 0, payload_size);
 
-    aes_cbc_decrypt(raop_buffer->aes_ctx, &data[12], output, encryptedlen);
-    aes_cbc_reset(raop_buffer->aes_ctx);
+    if (raop_buffer->aes_ctx) {
+        aes_cbc_decrypt(raop_buffer->aes_ctx, &data[12], output, encryptedlen);
+        aes_cbc_reset(raop_buffer->aes_ctx);
+    }
 
     memcpy(output + encryptedlen, &data[12 + encryptedlen], payload_size - encryptedlen);
     *outputlen = payload_size;

@@ -15,9 +15,22 @@ object NativeBridge {
         /** Verified mirror-stream lifetime; owns renderer state. */
         fun onMirrorRunning(running: Boolean)
 
+        /**
+         * Verified audio-stream lifetime (the audio RTP thread), for both the audio of a
+         * mirroring session and audio-only sessions (Music / iTunes, iOS audio-only).
+         * [ct] is the negotiated AirPlay codec: [CT_ALAC] or [CT_AAC_ELD]. ALAC is decoded
+         * natively; its frames reach [onAudioFrame] as 16-bit stereo PCM tagged [CT_PCM].
+         */
+        fun onAudioRunning(running: Boolean, ct: Int) {}
+
         /** Unexpected mirror failure; the controller resets the server outside native callbacks. */
         fun onStreamError()
     }
+
+    /** Audio codec tags shared with wormhole_jni.c (AirPlay "ct" values; 0 = decoded PCM). */
+    const val CT_PCM = 0
+    const val CT_ALAC = 2
+    const val CT_AAC_ELD = 8
 
     init { System.loadLibrary("wormhole") }
 

@@ -19,6 +19,9 @@
 #define GLOBAL_H
 
 #define GLOBAL_MODEL    "AppleTV3,2"
+/* Android port: legacy RAOP audio (iTunes/macOS Music) selects RSA vs FairPlay by model;
+ * an AirPort Express model routes them to the RSA/ANNOUNCE path this receiver implements. */
+#define GLOBAL_RAOP_MODEL "AirPort4,107"
 #define GLOBAL_VERSION  "220.68"
 
 /* use old protocol for audio AES key if client's User-Agent string is contained in these strings */

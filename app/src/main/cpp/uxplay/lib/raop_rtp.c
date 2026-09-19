@@ -676,6 +676,10 @@ raop_rtp_thread_udp(void *arg)
     MUTEX_LOCK(raop_rtp->run_mutex);
     raop_rtp->running = false;
     MUTEX_UNLOCK(raop_rtp->run_mutex);
+    /* Android port: audio stream ended (TEARDOWN, connection loss or socket error) */
+    if (raop_rtp->callbacks.audio_running) {
+        raop_rtp->callbacks.audio_running(raop_rtp->callbacks.cls, false);
+    }
 
     logger_log(raop_rtp->logger, LOGGER_DEBUG, "raop_rtp exiting thread");
 
@@ -719,6 +723,10 @@ raop_rtp_start_audio(raop_rtp_t *raop_rtp,  unsigned short *control_rport, unsig
     /* Create the thread and initialize running values */
     raop_rtp->running = 1;
     raop_rtp->joined = 0;
+    /* Android port: report verified audio stream lifetime (see mirror_video_running) */
+    if (raop_rtp->callbacks.audio_running) {
+        raop_rtp->callbacks.audio_running(raop_rtp->callbacks.cls, true);
+    }
 
     THREAD_CREATE(raop_rtp->thread, raop_rtp_thread_udp, raop_rtp);
     MUTEX_UNLOCK(raop_rtp->run_mutex);

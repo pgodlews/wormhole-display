@@ -27,7 +27,11 @@
 #define RAOP_TXTVERS "1"
 #define RAOP_CH "2"             /* Audio channels: 2 */
 #define RAOP_CN "0,1,2,3"       /* Audio codec: PCM, ALAC, AAC, AAC ELD */
-#define RAOP_ET "0,3,5"         /* Encryption type: None, FairPlay, FairPlay SAPv2.5 */
+/* Android port: iTunes / macOS Music only speak FairPlay v2, which no open receiver implements;
+ * advertising RSA ("1") makes them fall back to the AirPort Express key exchange instead.
+ * Mirroring senders negotiate FairPlay v3 from the _airplay._tcp features, not from this list. */
+#define RAOP_ET "0,1"           /* Encryption type: None, RSA (AirPort Express) */
+#define RAOP_EK "1"             /* Encryption key present (RSA) */
 #define RAOP_VV "2"
 #define FEATURES_1 "0x5A7FFEE6" /* first 32 bits of features, with bit 27 ("supports legacy pairing") ON */
 //#define FEATURES_1 "0x527FFEE6" /* first 32 bits of features, with bit 27 ("supports legacy pairing") OFF */
