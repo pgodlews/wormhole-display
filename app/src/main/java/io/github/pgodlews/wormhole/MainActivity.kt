@@ -37,6 +37,7 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
@@ -428,6 +429,11 @@ private fun DashboardScreen(
     onOrientationSettingChanged: (ScreenOrientation) -> Unit
 ) {
     var showNameDialog by remember { mutableStateOf(false) }
+    var showHaDialog by remember { mutableStateOf(false) }
+    // Re-read on each dialog close so the row summary reflects saved config.
+    var haConfigTick by remember { mutableStateOf(0) }
+    val haEnabled = remember(haConfigTick) { WormholeServer.haEnabled }
+    val haEntity = remember(haConfigTick) { WormholeServer.haEntity }
     val configuration = LocalConfiguration.current
     val context = LocalContext.current
     val isAutoSupported = remember(context) { WormholeIdentity.hasOrientationSensor(context) }
@@ -933,6 +939,59 @@ private fun DashboardScreen(
                     HorizontalDivider(color = Color(0xFF1F3146), thickness = 0.5.dp)
                     Spacer(modifier = Modifier.height(dividerSpacing))
 
+                    // Row 5b: Home Assistant now-playing
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .tvFocusable(
+                                shape = RoundedCornerShape(8.dp),
+                                onClick = { showHaDialog = true }
+                            )
+                            .padding(
+                                horizontal = if (isTvOrCompact) 8.dp else 10.dp,
+                                vertical = if (isTvOrCompact) 1.dp else 6.dp
+                            ),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Home Assistant",
+                                fontSize = if (isTvOrCompact) 12.sp else 15.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = Color(0xFFE2E8F0)
+                            )
+                            Text(
+                                text = if (haEnabled)
+                                    "Publishing now-playing to $haEntity"
+                                else
+                                    "Publish now-playing metadata to a Home Assistant entity",
+                                fontSize = if (isTvOrCompact) 10.sp else 12.sp,
+                                color = Color(0xFF94A3B8)
+                            )
+                        }
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            border = BorderStroke(1.dp, if (haEnabled) Color(0xFF7DE2CE) else Color(0xFF1E5246)),
+                            color = if (haEnabled) Color(0xFF0E2A24) else Color(0xFF0F1A26)
+                        ) {
+                            Text(
+                                text = if (haEnabled) "On" else "Configure",
+                                fontSize = if (isTvOrCompact) 10.sp else 12.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = if (haEnabled) Color(0xFF7DE2CE) else Color(0xFF94A3B8),
+                                modifier = Modifier.padding(
+                                    horizontal = if (isTvOrCompact) 8.dp else 12.dp,
+                                    vertical = if (isTvOrCompact) 3.dp else 6.dp
+                                )
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(dividerSpacing))
+                    HorizontalDivider(color = Color(0xFF1F3146), thickness = 0.5.dp)
+                    Spacer(modifier = Modifier.height(dividerSpacing))
+
                     // Row 6: Receiver Service
                     Row(
                         modifier = Modifier
@@ -1340,6 +1399,97 @@ private fun DashboardScreen(
             }
         )
     }
+
+    if (showHaDialog) {
+        HaConfigDialog(onDismiss = {
+            showHaDialog = false
+            haConfigTick++
+        })
+    }
+}
+
+@Composable
+private fun HaConfigDialog(onDismiss: () -> Unit) {
+    var enabled by remember { mutableStateOf(WormholeServer.haEnabled) }
+    var url by remember { mutableStateOf(WormholeServer.haUrl) }
+    var token by remember { mutableStateOf(WormholeServer.haToken) }
+    var entity by remember { mutableStateOf(WormholeServer.haEntity) }
+
+    val fieldColors = OutlinedTextFieldDefaults.colors(
+        focusedBorderColor = Color(0xFF7DE2CE),
+        unfocusedBorderColor = Color(0xFF1E5246),
+        focusedTextColor = Color(0xFFF1F5F9),
+        unfocusedTextColor = Color(0xFFF1F5F9),
+        cursorColor = Color(0xFF7DE2CE),
+        focusedLabelColor = Color(0xFF7DE2CE),
+        unfocusedLabelColor = Color(0xFF94A3B8)
+    )
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Color(0xFF142131),
+        title = { Text("Home Assistant now-playing", color = Color(0xFFF1F5F9)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "Publishes AirPlay title, artist, album and cover art to a Home Assistant " +
+                        "entity over the REST API. Create a Long-Lived Access Token in your HA " +
+                        "profile. Everything stays on your local network.",
+                    fontSize = 12.sp, color = Color(0xFF94A3B8)
+                )
+                Row(
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Enable", color = Color(0xFFE2E8F0))
+                    Switch(
+                        checked = enabled,
+                        onCheckedChange = { enabled = it },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Color(0xFF09121E),
+                            checkedTrackColor = Color(0xFF7DE2CE),
+                            uncheckedThumbColor = Color(0xFF94A3B8),
+                            uncheckedTrackColor = Color(0xFF1B2B3E)
+                        )
+                    )
+                }
+                OutlinedTextField(
+                    value = url, onValueChange = { url = it },
+                    label = { Text("Base URL (e.g. http://homeassistant.local:8123)") },
+                    singleLine = true, colors = fieldColors, modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = token, onValueChange = { token = it },
+                    label = { Text("Long-Lived Access Token") },
+                    singleLine = true, visualTransformation = PasswordVisualTransformation(),
+                    colors = fieldColors, modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = entity, onValueChange = { entity = it },
+                    label = { Text("Entity ID") },
+                    singleLine = true, colors = fieldColors, modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    WormholeServer.setHaConfig(enabled, url.trim(), token.trim(), entity.trim())
+                    onDismiss()
+                },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF7DE2CE), contentColor = Color(0xFF09121E)
+                ),
+                shape = RoundedCornerShape(10.dp)
+            ) { Text("Save & Apply") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel", color = Color(0xFF94A3B8))
+            }
+        }
+    )
 }
 
 @Composable

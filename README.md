@@ -37,6 +37,7 @@ Wormhole Display is an independent community project and is not affiliated with 
 - **Hardware video decoding**: H.264 on the Portal's hardware decoder, with experimental HEVC for senders that support it.
 - **Sound through the Portal**: audio plays on the Portal's speakers and can be muted from the dashboard.
 - **AirPlay speaker (audio-only)**: play music straight to the Portal from an **iPhone or iPad** (Control Center → AirPlay, or the AirPlay button in Apple Music, Podcasts, etc.), without mirroring. ALAC is decoded on-device.
+- **Home Assistant now-playing (optional)**: publish the current track (title, artist, album, cover art) to a Home Assistant entity, so a wall-panel dashboard can show what the Portal is playing. Off by default; configured in the app.
 - **Opens when you connect**: the receiver stays available in the background and brings itself full screen when a stream starts. It can also start when the Portal boots.
 - **Back or Home to disconnect**: leaving the stream on the Portal ends the session on your Mac or iPhone too.
 - **Several Portals, one network**: each device has its own identity, so a Portal+ and a Portal TV can both be available at once.
@@ -104,6 +105,53 @@ Open **Control Center → Screen Mirroring** and pick your Portal.
 Press **Back** or **Home** on the Portal, or stop Screen Mirroring on your Mac, iPhone or iPad.
 
 ---
+
+## Home Assistant now-playing (optional)
+
+If you use a Portal as a Home Assistant wall panel, Wormhole Display can publish
+what's currently AirPlaying to a Home Assistant entity, so a dashboard card can
+show the title, artist, album and cover art.
+
+It uses Home Assistant's REST API over your local network — no add-on or MQTT
+broker required.
+
+<p align="center"><img src="docs/images/ha-now-playing.jpg" width="720" alt="Now-playing on a Portal Home Assistant dashboard (WallPanel screensaver)"/><br/><em>Now-playing surfaced on a Portal used as a Home Assistant wall panel</em></p>
+
+1. In Home Assistant, open your **profile** (bottom of the sidebar) and, under
+   *Long-Lived Access Tokens*, **Create Token**. Copy it.
+2. In Wormhole Display, open **Settings → Home Assistant**, turn it **On**, and enter:
+   - **Base URL** — e.g. `http://homeassistant.local:8123` (or `http://<ha-ip>:8123`)
+   - **Long-Lived Access Token** — the token from step 1
+   - **Entity ID** — defaults to `sensor.wormhole_now_playing`
+3. Play something to the Portal over AirPlay. The entity updates with:
+   `state` (track title), and attributes `media_title`, `media_artist`,
+   `media_album_name`, `media_year`, `media_duration`, `media_position`, and
+   `entity_picture` (cover art, served from the Portal on your LAN).
+
+Example dashboard card (Markdown):
+
+```yaml
+type: markdown
+content: >
+  {% set e = 'sensor.wormhole_now_playing' %}
+  {% if states(e) not in ['off','unavailable','unknown',''] %}
+  {% set art = state_attr(e,'entity_picture') %}
+  {% if art %}![]({{ art }}){% endif %}
+
+  **{{ state_attr(e,'media_title') }}**
+
+  {{ state_attr(e,'media_artist') }} — {{ state_attr(e,'media_album_name') }}
+  {% else %}_Nothing playing_{% endif %}
+```
+
+Notes:
+- The entity is created via the REST API, so it resets to *idle* if Home
+  Assistant restarts while nothing is playing; it repopulates on the next track.
+- Cover art is served from a small HTTP endpoint on the Portal
+  (`http://<portal-ip>:8098/art.jpg`); Home Assistant clients fetch it directly
+  over the LAN.
+- Metadata is only as good as the sender provides. iOS/iPadOS senders send full
+  metadata and artwork; some senders send less.
 
 ## Building from source
 

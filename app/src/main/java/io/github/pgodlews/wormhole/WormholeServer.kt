@@ -112,6 +112,9 @@ object WormholeServer {
     )
     val audioRenderer = AudioRenderer(renderer.telemetry)
 
+    // Pushes AirPlay now-playing metadata to Home Assistant (no-op until configured in prefs).
+    private lateinit var haPublisher: HomeAssistantPublisher
+
     // Activity state
     @Volatile
     var isActivityResumed: Boolean = false
@@ -148,6 +151,8 @@ object WormholeServer {
         startOnBoot = prefs.getBoolean("start_on_boot", true)
 
         audioRenderer.audioEnabled = audioEnabled
+
+        haPublisher = HomeAssistantPublisher(prefs)
 
         val autoSupported = WormholeIdentity.hasOrientationSensor(appContext)
         val defaultOrientation = ScreenOrientation.LANDSCAPE
@@ -199,6 +204,29 @@ object WormholeServer {
     fun updateServiceName(newName: String) {
         identity.serviceName = newName
         restartServer()
+    }
+
+    // --- Home Assistant now-playing config (read by HomeAssistantPublisher) ---
+    val haUrl: String get() = if (::prefs.isInitialized) prefs.getString("ha_url", "")!! else ""
+    val haToken: String get() = if (::prefs.isInitialized) prefs.getString("ha_token", "")!! else ""
+    val haEntity: String get() = if (::prefs.isInitialized) prefs.getString("ha_entity", HomeAssistantPublisher.DEFAULT_ENTITY)!! else HomeAssistantPublisher.DEFAULT_ENTITY
+    // Enabled defaults to on when a URL and token are already present (back-compat with
+    // setups configured before this toggle existed).
+    val haEnabled: Boolean get() = ::prefs.isInitialized &&
+        prefs.getBoolean("ha_enabled", haUrl.isNotBlank() && haToken.isNotBlank())
+
+    fun setHaConfig(enabled: Boolean, url: String, token: String, entity: String) {
+        prefs.edit()
+            .putBoolean("ha_enabled", enabled)
+            .putString("ha_url", url)
+            .putString("ha_token", token)
+            .putString("ha_entity", entity.ifBlank { HomeAssistantPublisher.DEFAULT_ENTITY })
+            .apply()
+        // Apply immediately if the receiver is running.
+        haPublisher.stop()
+        if (callbacksEnabled.get()) {
+            haPublisher.start(NetworkInfoHelper.getLocalIpAddress() ?: "")
+        }
     }
 
     fun setOrientationSetting(setting: ScreenOrientation) {
@@ -285,6 +313,7 @@ object WormholeServer {
                     renderer.hevcDecoder != null
                 )
                 check(port > 0) { "Server failed to start ($port)" }
+                haPublisher.start(NetworkInfoHelper.getLocalIpAddress() ?: "")
                 if (mirrorGeneration.get() == startEvent) {
                     _isMirroring.value = false
                     _clientName.value = null
@@ -300,6 +329,7 @@ object WormholeServer {
                 try {
                     NativeBridge.nativeStop()
                 } finally {
+                    haPublisher.stop()
                     identity.releaseMulticastLock()
                 }
             },
@@ -394,6 +424,18 @@ object WormholeServer {
             if (callbacksEnabled.get()) audioRenderer.flush()
         }
 
+        override fun onNowPlaying(title: String, artist: String, album: String, year: Int) {
+            if (callbacksEnabled.get()) haPublisher.onMetadata(title, artist, album, year)
+        }
+
+        override fun onCoverArt(data: ByteArray, isPng: Boolean) {
+            if (callbacksEnabled.get()) haPublisher.onCoverArt(data, isPng)
+        }
+
+        override fun onProgress(positionSec: Double, durationSec: Double) {
+            if (callbacksEnabled.get()) haPublisher.onProgress(positionSec, durationSec)
+        }
+
         override fun onClientConnected(name: String) {
             sessionClientName = name
             if (callbacksEnabled.get()) {
@@ -415,6 +457,7 @@ object WormholeServer {
             }
             if (running) {
                 audioRenderer.beginSession(codec)
+                haPublisher.onSessionStart()
                 // Audio arriving outside a mirroring session is an AirPlay speaker session
                 // (Music / iTunes on a Mac, or iOS audio-only). Mirroring owns the UI otherwise.
                 if (!_isMirroring.value) {
@@ -440,6 +483,7 @@ object WormholeServer {
                     _statusText.value = idleStatus
                     Log.i(TAG, "Audio-only session ended")
                 }
+                haPublisher.onSessionEnd()
                 if (!_isMirroring.value) {
                     audioRenderer.endSession()
                 }

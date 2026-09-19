@@ -28,7 +28,7 @@ target_compile_options(mirror-core PRIVATE -w)
 add_library(alac-decoder STATIC ${CMAKE_CURRENT_SOURCE_DIR}/alac/alac_decoder.c)
 target_include_directories(alac-decoder PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/alac)
 
-add_library(wormhole SHARED wormhole_jni.c)
+add_library(wormhole SHARED wormhole_jni.c ${CMAKE_CURRENT_SOURCE_DIR}/dmap.c)
 target_link_libraries(wormhole
     alac-decoder
     mirror-core

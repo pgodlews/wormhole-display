@@ -23,6 +23,15 @@ object NativeBridge {
          */
         fun onAudioRunning(running: Boolean, ct: Int) {}
 
+        /** Now-playing metadata from the RAOP stream (DMAP). Empty strings mean "absent". */
+        fun onNowPlaying(title: String, artist: String, album: String, year: Int) {}
+
+        /** Cover art bytes for the current track ([isPng] false = JPEG). */
+        fun onCoverArt(data: ByteArray, isPng: Boolean) {}
+
+        /** Playback position/duration in seconds (0 if unknown). */
+        fun onProgress(positionSec: Double, durationSec: Double) {}
+
         /** Unexpected mirror failure; the controller resets the server outside native callbacks. */
         fun onStreamError()
     }
