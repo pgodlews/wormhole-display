@@ -23,6 +23,19 @@ object NativeBridge {
          */
         fun onAudioRunning(running: Boolean, ct: Int) {}
 
+        /**
+         * Now-playing metadata (DMAP) for the current audio session; empty strings and a
+         * zero [year] mean absent. Like the other audio callbacks it runs on the audio RTP
+         * thread, between [onAudioRunning] true and false.
+         */
+        fun onNowPlaying(title: String, artist: String, album: String, year: Int) {}
+
+        /** Cover art for the current track, as sent: PNG if [isPng], otherwise JPEG. */
+        fun onCoverArt(data: ByteArray, isPng: Boolean) {}
+
+        /** Playback position and track duration in seconds (0 when unknown). */
+        fun onProgress(positionSec: Double, durationSec: Double) {}
+
         /** Unexpected mirror failure; the controller resets the server outside native callbacks. */
         fun onStreamError()
     }

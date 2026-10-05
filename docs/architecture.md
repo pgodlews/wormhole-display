@@ -21,6 +21,16 @@ renderers with `MediaCodec` + `SurfaceView` for video and `AudioTrack` for audio
   Decrypted Annex-B H.264/HEVC is copied to `VideoFrameQueue` → `VideoRenderer`
   (hardware `MediaCodec` on a `Surface`); decrypted AAC-ELD is copied to
   `AudioRenderer`.
+- **Now-playing callbacks** — the core hands over the metadata an audio sender
+  attaches with `SET_PARAMETER`: DMAP track info, cover art and `progress:` RTP
+  timestamps. The shim parses DMAP (`cpp/dmap.c`) and forwards
+  `NativeBridge.Listener.onNowPlaying`, `onCoverArt` and `onProgress`. They run on the
+  audio RTP thread, only between `onAudioRunning(true)` and `onAudioRunning(false)`,
+  and are default no-ops on the listener. Track text is decoded leniently through
+  `String(bytes, "UTF-8")`, since senders' bytes need not be the modified UTF-8 that
+  `NewStringUTF` requires. `WormholeServer` keeps a `NowPlaying` state (position is
+  extrapolated while audio flows and frozen on a flush) and decodes the art off the
+  RTP thread; `MainActivity` shows it full screen for audio-only sessions.
 - **App layer** (Kotlin) — `WormholeService` (foreground service, multicast and
   wake locks, boot autostart), `WormholeServer` (process-wide owner of the native
   server, renderers and UI state), `MainActivity` (Compose dashboard and video

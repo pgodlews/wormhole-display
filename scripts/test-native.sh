@@ -14,3 +14,7 @@ if [ "${GUARD_MALLOC:-0}" = 1 ]; then
 else
   "$test_dir/mirror-regression"
 fi
+"${CC:-clang}" -g -O1 -fsanitize="${SANITIZERS:-undefined}" -fno-omit-frame-pointer -fno-sanitize-recover=all \
+  -I"$repo_dir/app/src/main/cpp" \
+  "$repo_dir/tests/native/dmap_test.c" "$repo_dir/app/src/main/cpp/dmap.c" -o "$test_dir/dmap-test"
+"$test_dir/dmap-test"

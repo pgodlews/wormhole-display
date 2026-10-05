@@ -73,7 +73,7 @@ class WormholeService : Service() {
         }
 
         WormholeServer.init(applicationContext)
-        // Single launch path: WormholeServer fires this when a mirror session starts while the activity isn't resumed.
+        // Single launch path: WormholeServer fires this when a mirroring or audio-only session starts while the activity isn't resumed.
         WormholeServer.onIncomingStreamBackgroundCallback = {
             launchMainActivity()
         }
