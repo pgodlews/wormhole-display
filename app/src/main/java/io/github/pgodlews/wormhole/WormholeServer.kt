@@ -3,6 +3,9 @@ package io.github.pgodlews.wormhole
 import android.content.Context
 import android.content.SharedPreferences
 import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Display
@@ -11,6 +14,7 @@ import android.view.WindowManager
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -22,6 +26,7 @@ import java.util.concurrent.atomic.AtomicLong
  */
 object WormholeServer {
     private const val TAG = "WormholeServer"
+    private const val MAX_ART_PX = 1024
 
     private lateinit var appContext: Context
     private lateinit var prefs: SharedPreferences
@@ -41,6 +46,13 @@ object WormholeServer {
     /** An audio-only AirPlay session (Music / iTunes, iOS audio) is playing through the speakers. */
     private val _isAudioStreaming = MutableStateFlow(false)
     val isAudioStreaming: StateFlow<Boolean> = _isAudioStreaming.asStateFlow()
+
+    /** Track metadata and position for the audio session; shown full screen for audio-only sessions. */
+    private val _nowPlaying = MutableStateFlow(NowPlaying())
+    val nowPlaying: StateFlow<NowPlaying> = _nowPlaying.asStateFlow()
+
+    private val _nowPlayingArt = MutableStateFlow<Bitmap?>(null)
+    val nowPlayingArt: StateFlow<Bitmap?> = _nowPlayingArt.asStateFlow()
 
     private val _statusText = MutableStateFlow("Starting receiver…")
     val statusText: StateFlow<String> = _statusText.asStateFlow()
@@ -127,6 +139,11 @@ object WormholeServer {
     private val callbacksEnabled = AtomicBoolean(false)
     private val callbackGeneration = AtomicLong()
     private val mirrorGeneration = AtomicLong()
+
+    // Cover art is decoded off the audio RTP thread; a late decode must not outlive its session.
+    private val artExecutor = Executors.newSingleThreadExecutor { r -> Thread(r, "Wormhole cover art") }
+    private val artLock = Any()
+    private var artGeneration = 0L  // guarded by artLock
 
     val idleStatus: String
         get() = "Visible in Screen Mirroring and as an AirPlay speaker as “${identity.serviceName}”"
@@ -318,6 +335,7 @@ object WormholeServer {
         lease = null
         _isMirroring.value = false
         _isAudioStreaming.value = false
+        clearNowPlaying()
         _clientName.value = null
         _statusText.value = "Receiver stopped"
     }
@@ -331,6 +349,7 @@ object WormholeServer {
             mirrorGeneration.incrementAndGet()
             _isMirroring.value = false
             _isAudioStreaming.value = false
+            clearNowPlaying()
             _videoAspectRatio.value = null
             _clientName.value = null
             _statusText.value = "Restarting receiver…"
@@ -355,10 +374,43 @@ object WormholeServer {
         mirrorGeneration.incrementAndGet()
         _isMirroring.value = false
         _isAudioStreaming.value = false
+        clearNowPlaying()
         _videoAspectRatio.value = null
         _clientName.value = null
         _statusText.value = "Stream interrupted — reconnect from Screen Mirroring"
         lease?.let { serverLifecycle.restart(it) }
+    }
+
+    private fun clearNowPlaying() {
+        synchronized(artLock) {
+            artGeneration++
+            _nowPlayingArt.value = null
+        }
+        _nowPlaying.value = NowPlaying()
+    }
+
+    private fun showCoverArt(data: ByteArray) {
+        val generation = synchronized(artLock) { artGeneration }
+        artExecutor.execute {
+            val bitmap = decodeCoverArt(data)
+            synchronized(artLock) {
+                if (artGeneration == generation) _nowPlayingArt.value = bitmap
+            }
+        }
+    }
+
+    /** Decodes JPEG or PNG art, downsampled so neither side exceeds [MAX_ART_PX]. */
+    private fun decodeCoverArt(data: ByteArray): Bitmap? = try {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(data, 0, data.size, bounds)
+        var sample = 1
+        while (bounds.outWidth / sample > MAX_ART_PX || bounds.outHeight / sample > MAX_ART_PX) {
+            sample *= 2
+        }
+        BitmapFactory.decodeByteArray(data, 0, data.size, BitmapFactory.Options().apply { inSampleSize = sample })
+    } catch (t: Throwable) {
+        Log.w(TAG, "Cover art decode failed (${data.size} bytes)", t)
+        null
     }
 
     private fun recordSessionEnd() {
@@ -383,7 +435,12 @@ object WormholeServer {
         }
 
         override fun onAudioFrame(data: ByteArray, ntpTimestamp: Long, ct: Int) {
-            if (callbacksEnabled.get()) audioRenderer.onFrame(data, ntpTimestamp, ct)
+            if (!callbacksEnabled.get()) return
+            audioRenderer.onFrame(data, ntpTimestamp, ct)
+            // Audio flowing again after a flush (pause or seek): resume the progress clock.
+            if (!_nowPlaying.value.playing) {
+                _nowPlaying.update { it.resumed(SystemClock.elapsedRealtime()) }
+            }
         }
 
         override fun onAudioVolume(volume: Float) {
@@ -391,7 +448,23 @@ object WormholeServer {
         }
 
         override fun onAudioFlush() {
-            if (callbacksEnabled.get()) audioRenderer.flush()
+            if (!callbacksEnabled.get()) return
+            audioRenderer.flush()
+            _nowPlaying.update { it.paused(SystemClock.elapsedRealtime()) }
+        }
+
+        override fun onNowPlaying(title: String, artist: String, album: String, year: Int) {
+            if (!callbacksEnabled.get()) return
+            _nowPlaying.update { it.withMetadata(title, artist, album, year) }
+        }
+
+        override fun onCoverArt(data: ByteArray, isPng: Boolean) {
+            if (callbacksEnabled.get()) showCoverArt(data)
+        }
+
+        override fun onProgress(positionSec: Double, durationSec: Double) {
+            if (!callbacksEnabled.get()) return
+            _nowPlaying.update { it.withProgress(positionSec, durationSec, SystemClock.elapsedRealtime()) }
         }
 
         override fun onClientConnected(name: String) {
@@ -413,6 +486,8 @@ object WormholeServer {
                 NativeBridge.CT_AAC_ELD -> "AAC-ELD"
                 else -> "ct=$ct"
             }
+            // Metadata, art and progress arrive only between these two callbacks.
+            clearNowPlaying()
             if (running) {
                 audioRenderer.beginSession(codec)
                 // Audio arriving outside a mirroring session is an AirPlay speaker session
@@ -422,6 +497,9 @@ object WormholeServer {
                     _isAudioStreaming.value = true
                     _statusText.value = "Playing audio from ${_clientName.value ?: "AirPlay"}"
                     Log.i(TAG, "Audio-only session started ($codec)")
+                    if (!isActivityResumed) {
+                        onIncomingStreamBackgroundCallback?.invoke()
+                    }
                 }
             } else {
                 if (_isAudioStreaming.value) {

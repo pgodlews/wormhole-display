@@ -21,6 +21,7 @@ app/src/main/cpp/uxplay/lib/llhttp/       bundled HTTP parser (MIT)
 app/src/main/cpp/uxplay/lib/playfair/     FairPlay handshake crypto
 app/src/main/cpp/uxplay/lib/mdnsd/        embedded mDNS responder (the Bonjour advertiser)
 app/src/main/cpp/wormhole_jni.c           JNI shim: server lifecycle + all raop callbacks
+app/src/main/cpp/dmap.c                   DMAP parser for now-playing metadata (title/artist/album/year)
 app/src/main/cpp/deps/                    committed prebuilt static libs (openssl, plist)
 app/src/main/java/io/github/pgodlews/wormhole/
     MainActivity.kt                       Compose dashboard + video surface
@@ -30,10 +31,11 @@ app/src/main/java/io/github/pgodlews/wormhole/
     ScreenOrientation.kt                  portrait/landscape/auto orientation modes and model helpers
     VideoFrameQueue.kt, VideoRenderer.kt  compressed-frame queue → MediaCodec → Surface (H.264/HEVC)
     AudioRenderer.kt                      AAC-ELD decode → AudioTrack
+    NowPlaying.kt                         track metadata + extrapolated position for audio-only sessions
     WormholeIdentity.kt                   persisted deviceid, service name, Wi-Fi multicast lock
 scripts/build.sh                          build APK → dist/wormhole-display.apk
 scripts/build-deps.sh                     rebuild the native deps (rarely needed)
-scripts/test-native.sh                    host regression tests for the vendored mirror loop
+scripts/test-native.sh                    host regression tests for the vendored mirror loop and the DMAP parser
 docs/architecture.md                      design overview
 docs/uxplay-patches.md                    inventory of vendored-code changes
 ```
@@ -143,6 +145,11 @@ adb logcat | grep -E "uxplay|Wormhole|AndroidRuntime|libc"
   PCM (`ct=0`) before the JNI hop. The negotiated codec/lifetime reach Kotlin via
   the `audio_running(bool, ct)` callback. Dropping audio frames is protocol-safe
   (the core handles resends).
+- **Now playing**: DMAP metadata, cover art and progress reach Kotlin through
+  `onNowPlaying` / `onCoverArt` / `onProgress` (see `docs/architecture.md`). Never pass
+  sender text to `NewStringUTF`: build strings with `utf8_jstring` (CheckJNI aborts
+  debug builds on invalid modified UTF-8). An audio-only session brings the app forward
+  like mirroring and shows `NowPlayingScreen`; Back/Home disconnects the sender.
 - **Legacy RAOP audio (RSA)**: `rsakey.c` holds the AirPort Express key; `raop.c`
   answers `Apple-Challenge` and dispatches `ANNOUNCE`; `raop_handlers.h` parses
   the SDP (RSA-OAEP AES key, ALAC fmtp) and the Transport-header SETUP. The RAOP

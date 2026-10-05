@@ -12,6 +12,7 @@
 #include "stream.h"
 #include "logger.h"
 #include "alac_decoder.h"
+#include "dmap.h"
 
 #define TAG "Wormhole"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -23,7 +24,13 @@ static jobject g_listener;                          /* guarded by g_listener_loc
 static pthread_mutex_t g_listener_lock = PTHREAD_MUTEX_INITIALIZER;
 static jmethodID g_on_video_frame, g_on_audio_frame, g_on_audio_volume, g_on_audio_flush,
                  g_on_client_connected, g_on_client_disconnected,
-                 g_on_mirror_running, g_on_audio_running, g_on_stream_error;
+                 g_on_mirror_running, g_on_audio_running, g_on_stream_error,
+                 g_on_now_playing, g_on_cover_art, g_on_progress;
+/* java.lang.String(byte[], String charsetName): builds track text leniently from
+ * sender bytes, which need not be valid (modified) UTF-8 as NewStringUTF requires. */
+static jclass g_string_class;
+static jmethodID g_string_from_bytes;
+static jstring g_utf8_charset;
 static raop_t *g_raop;                              /* guarded by g_lock */
 static dnssd_t *g_dnssd;                            /* guarded by g_lock */
 static bool g_allow_hevc;                           /* immutable while server workers run */
@@ -235,9 +242,81 @@ static void cb_audio_set_volume(void *cls, float v) {
     (*env)->DeleteLocalRef(env, listener);
     if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); }
 }
-static void cb_audio_set_data(void *cls, const void *b, int l) {}
+
+/* Malformed sequences become U+FFFD instead of tripping CheckJNI in debug builds. */
+static jstring utf8_jstring(JNIEnv *env, const char *s) {
+    jsize len = (jsize) strlen(s);
+    jbyteArray bytes = (*env)->NewByteArray(env, len);
+    if (!bytes) { (*env)->ExceptionClear(env); return NULL; }
+    (*env)->SetByteArrayRegion(env, bytes, 0, len, (const jbyte *) s);
+    jstring str = (*env)->NewObject(env, g_string_class, g_string_from_bytes, bytes, g_utf8_charset);
+    (*env)->DeleteLocalRef(env, bytes);
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); return NULL; }
+    return str;
+}
+
+/* Now-playing metadata (SET_PARAMETER application/x-dmap-tagged), delivered on the
+ * audio RTP thread between audio_running(true) and audio_running(false). */
+static void cb_audio_set_metadata(void *cls, const void *buf, int len) {
+    if (!buf || len <= 0) return;
+    dmap_meta_t m;
+    dmap_parse((const unsigned char *) buf, (size_t) len, &m);
+    JNIEnv *env = env_for_thread();
+    if (!env) return;
+    jobject listener = listener_snapshot(env);
+    if (!listener) return;
+    jstring title = utf8_jstring(env, m.have_title ? m.title : "");
+    jstring artist = utf8_jstring(env, m.have_artist ? m.artist : "");
+    jstring album = utf8_jstring(env, m.have_album ? m.album : "");
+    if (title && artist && album) {
+        (*env)->CallVoidMethod(env, listener, g_on_now_playing, title, artist, album, (jint) m.year);
+    }
+    if (title) (*env)->DeleteLocalRef(env, title);
+    if (artist) (*env)->DeleteLocalRef(env, artist);
+    if (album) (*env)->DeleteLocalRef(env, album);
+    (*env)->DeleteLocalRef(env, listener);
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); }
+}
+
+/* Cover art (SET_PARAMETER image/jpeg or image/png); the core frees the buffer on return. */
+static void cb_audio_set_coverart(void *cls, const void *buf, int len) {
+    if (!buf || len <= 0) return;
+    const unsigned char *b = (const unsigned char *) buf;
+    jboolean is_png = (len >= 8 && b[0] == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G') ? JNI_TRUE : JNI_FALSE;
+    JNIEnv *env = env_for_thread();
+    if (!env) return;
+    jobject listener = listener_snapshot(env);
+    if (!listener) return;
+    jbyteArray art = (*env)->NewByteArray(env, len);
+    if (!art) {
+        (*env)->ExceptionClear(env);
+        (*env)->DeleteLocalRef(env, listener);
+        return;
+    }
+    (*env)->SetByteArrayRegion(env, art, 0, len, (const jbyte *) b);
+    (*env)->CallVoidMethod(env, listener, g_on_cover_art, art, is_png);
+    (*env)->DeleteLocalRef(env, art);
+    (*env)->DeleteLocalRef(env, listener);
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); }
+}
+
 static void cb_audio_remote_control(void *cls, const char *a, const char *b) {}
-static void cb_audio_set_progress(void *cls, uint32_t *s, uint32_t *c, uint32_t *e) {}
+
+/* SET_PARAMETER "progress: start/curr/end" in 44.1 kHz RTP timestamps. Differences are
+ * taken modulo 2^32 so a timestamp wrap inside a track stays correct. */
+static void cb_audio_set_progress(void *cls, uint32_t *start, uint32_t *curr, uint32_t *end) {
+    if (!start || !curr || !end) return;
+    int32_t pos = (int32_t) (*curr - *start);
+    int32_t dur = (int32_t) (*end - *start);
+    JNIEnv *env = env_for_thread();
+    if (!env) return;
+    jobject listener = listener_snapshot(env);
+    if (!listener) return;
+    (*env)->CallVoidMethod(env, listener, g_on_progress,
+                           (jdouble) (pos > 0 ? pos : 0) / 44100.0, (jdouble) (dur > 0 ? dur : 0) / 44100.0);
+    (*env)->DeleteLocalRef(env, listener);
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); }
+}
 /* The core reports the format the client negotiated in SETUP; it must not be
  * overridden (an earlier version forced AAC-ELD here, which broke ALAC sessions).
  * Mirroring sends AAC-ELD (ct=8, spf=480); Music / iTunes and iOS audio-only send
@@ -320,9 +399,24 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
     g_on_mirror_running = (*env)->GetMethodID(env, cls, "onMirrorRunning", "(Z)V");
     g_on_audio_running = (*env)->GetMethodID(env, cls, "onAudioRunning", "(ZI)V");
     g_on_stream_error = (*env)->GetMethodID(env, cls, "onStreamError", "()V");
-    return (g_on_video_frame && g_on_audio_frame && g_on_audio_volume && g_on_audio_flush
-            && g_on_client_connected && g_on_client_disconnected
-            && g_on_mirror_running && g_on_audio_running && g_on_stream_error) ? JNI_VERSION_1_6 : JNI_ERR;
+    g_on_now_playing = (*env)->GetMethodID(env, cls, "onNowPlaying",
+                                           "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)V");
+    g_on_cover_art = (*env)->GetMethodID(env, cls, "onCoverArt", "([BZ)V");
+    g_on_progress = (*env)->GetMethodID(env, cls, "onProgress", "(DD)V");
+    if (!(g_on_video_frame && g_on_audio_frame && g_on_audio_volume && g_on_audio_flush
+          && g_on_client_connected && g_on_client_disconnected
+          && g_on_mirror_running && g_on_audio_running && g_on_stream_error
+          && g_on_now_playing && g_on_cover_art && g_on_progress)) return JNI_ERR;
+
+    jclass string_class = (*env)->FindClass(env, "java/lang/String");
+    if (!string_class) return JNI_ERR;
+    g_string_class = (*env)->NewGlobalRef(env, string_class);
+    (*env)->DeleteLocalRef(env, string_class);
+    g_string_from_bytes = (*env)->GetMethodID(env, g_string_class, "<init>", "([BLjava/lang/String;)V");
+    jstring utf8 = (*env)->NewStringUTF(env, "UTF-8");
+    g_utf8_charset = utf8 ? (*env)->NewGlobalRef(env, utf8) : NULL;
+    if (utf8) (*env)->DeleteLocalRef(env, utf8);
+    return (g_string_class && g_string_from_bytes && g_utf8_charset) ? JNI_VERSION_1_6 : JNI_ERR;
 }
 
 JNIEXPORT void Java_io_github_pgodlews_wormhole_NativeBridge_nativeSetListener(JNIEnv *env, jclass cls, jobject listener) {
@@ -358,8 +452,8 @@ JNIEXPORT jint Java_io_github_pgodlews_wormhole_NativeBridge_nativeStart(JNIEnv 
     callbacks.video_flush = cb_stub_flush;
     callbacks.audio_set_client_volume = cb_audio_get_volume;
     callbacks.audio_set_volume = cb_audio_set_volume;
-    callbacks.audio_set_metadata = cb_audio_set_data;
-    callbacks.audio_set_coverart = cb_audio_set_data;
+    callbacks.audio_set_metadata = cb_audio_set_metadata;
+    callbacks.audio_set_coverart = cb_audio_set_coverart;
     callbacks.audio_stop_coverart_rendering = cb_stub_void;
     callbacks.audio_remote_control_id = cb_audio_remote_control;
     callbacks.audio_set_progress = cb_audio_set_progress;

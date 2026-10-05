@@ -3,8 +3,10 @@ package io.github.pgodlews.wormhole
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Bundle
+import android.os.SystemClock
 import android.provider.Settings
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -14,6 +16,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -29,14 +32,20 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
@@ -165,6 +174,9 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val mirroring by WormholeServer.isMirroring.collectAsState()
+            val audioStreaming by WormholeServer.isAudioStreaming.collectAsState()
+            val nowPlaying by WormholeServer.nowPlaying.collectAsState()
+            val nowPlayingArt by WormholeServer.nowPlayingArt.collectAsState()
             val client by WormholeServer.clientName.collectAsState()
             val status by WormholeServer.statusText.collectAsState()
             val videoAspectRatio by WormholeServer.videoAspectRatio.collectAsState()
@@ -228,6 +240,15 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
                         }
+                    } else if (audioStreaming) {
+                        // Audio-only AirPlay (speaker) session: full-screen now playing, left with Back/Home like mirroring.
+                        BackHandler { WormholeServer.disconnectClient("back") }
+                        NowPlayingScreen(
+                            nowPlaying = nowPlaying,
+                            artwork = nowPlayingArt,
+                            clientName = client,
+                            debugOverlayEnabled = debugOverlayEnabled
+                        )
                     } else {
                         DashboardScreen(
                             serviceName = serviceName,
@@ -1339,6 +1360,166 @@ private fun DashboardScreen(
                 }
             }
         )
+    }
+}
+
+@Composable
+private fun NowPlayingScreen(
+    nowPlaying: NowPlaying,
+    artwork: Bitmap?,
+    clientName: String?,
+    debugOverlayEnabled: Boolean
+) {
+    val configuration = LocalConfiguration.current
+    val isPortraitLayout = configuration.orientation == Configuration.ORIENTATION_PORTRAIT
+    val isCompact = configuration.screenHeightDp <= 650 && !isPortraitLayout
+    val outerPadding = if (isCompact) 28.dp else 48.dp
+
+    var now by remember { mutableStateOf(SystemClock.elapsedRealtime()) }
+    LaunchedEffect(nowPlaying.playing, nowPlaying.sampledAtMillis) {
+        now = SystemClock.elapsedRealtime()
+        if (nowPlaying.playing) {
+            while (true) {
+                delay(500L)
+                now = SystemClock.elapsedRealtime()
+            }
+        }
+    }
+
+    val art = @Composable { modifier: Modifier ->
+        val image = remember(artwork) { artwork?.asImageBitmap() }
+        Box(
+            modifier = modifier
+                .clip(RoundedCornerShape(16.dp))
+                .background(Color(0xFF1B2B3E)),
+            contentAlignment = Alignment.Center
+        ) {
+            if (image != null) {
+                Image(
+                    bitmap = image,
+                    contentDescription = "Album art",
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+            } else {
+                Text(text = "♪", fontSize = 96.sp, color = Color(0xFF7DE2CE))
+            }
+        }
+    }
+
+    val details = @Composable { modifier: Modifier, centered: Boolean ->
+        val textAlign = if (centered) TextAlign.Center else TextAlign.Start
+        Column(
+            modifier = modifier,
+            horizontalAlignment = if (centered) Alignment.CenterHorizontally else Alignment.Start
+        ) {
+            Text(
+                text = nowPlaying.title.ifBlank { "AirPlay audio" },
+                fontSize = if (isCompact) 26.sp else 34.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFFF1F5F9),
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                textAlign = textAlign,
+                lineHeight = if (isCompact) 30.sp else 40.sp
+            )
+            if (nowPlaying.artist.isNotBlank()) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = nowPlaying.artist,
+                    fontSize = if (isCompact) 18.sp else 22.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = Color(0xFF7DE2CE),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = textAlign
+                )
+            }
+            val albumLine = listOfNotNull(
+                nowPlaying.album.ifBlank { null },
+                nowPlaying.year.takeIf { it > 0 }?.toString()
+            ).joinToString(" · ")
+            if (albumLine.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = albumLine,
+                    fontSize = if (isCompact) 14.sp else 17.sp,
+                    color = Color(0xFF94A3B8),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = textAlign
+                )
+            }
+            if (nowPlaying.durationSec > 0.0) {
+                val position = nowPlaying.positionAt(now)
+                Spacer(modifier = Modifier.height(if (isCompact) 16.dp else 28.dp))
+                LinearProgressIndicator(
+                    progress = { (position / nowPlaying.durationSec).toFloat() },
+                    modifier = Modifier.fillMaxWidth().height(6.dp),
+                    color = Color(0xFF7DE2CE),
+                    trackColor = Color(0xFF1F3146)
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text(
+                        text = NowPlaying.formatTime(position),
+                        fontSize = 13.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = Color(0xFF94A3B8)
+                    )
+                    Text(
+                        text = "-" + NowPlaying.formatTime(nowPlaying.durationSec - position),
+                        fontSize = 13.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = Color(0xFF94A3B8)
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(if (isCompact) 14.dp else 24.dp))
+            Text(
+                text = "Playing from ${clientName ?: "AirPlay"}",
+                fontSize = if (isCompact) 12.sp else 14.sp,
+                color = Color(0xFF64748B),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                textAlign = textAlign
+            )
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Brush.verticalGradient(listOf(Color(0xFF142131), Color(0xFF09121E))))
+    ) {
+        if (isPortraitLayout) {
+            Column(
+                modifier = Modifier.fillMaxSize().padding(outerPadding),
+                verticalArrangement = Arrangement.Center,
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                art(Modifier.fillMaxWidth(0.85f).aspectRatio(1f))
+                Spacer(modifier = Modifier.height(36.dp))
+                details(Modifier.fillMaxWidth(0.85f), true)
+            }
+        } else {
+            Row(
+                modifier = Modifier.fillMaxSize().padding(outerPadding),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                art(Modifier.fillMaxHeight(0.8f).aspectRatio(1f, matchHeightConstraintsFirst = true))
+                Spacer(modifier = Modifier.width(if (isCompact) 32.dp else 56.dp))
+                details(Modifier.weight(1f), false)
+            }
+        }
+        if (debugOverlayEnabled) {
+            TelemetryOverlay(
+                telemetry = WormholeServer.renderer.telemetry,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(16.dp)
+            )
+        }
     }
 }
 
