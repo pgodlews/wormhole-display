@@ -130,6 +130,15 @@ Protocol details, contributor notes and troubleshooting are in [AGENTS.md](AGENT
 
 Wormhole Display is built on an Android port of [UxPlay](https://github.com/FDH2/UxPlay)'s C core (RTSP/RAOP, pairing, AES decryption, and an embedded mDNS responder). UxPlay's desktop GStreamer pipelines are replaced with Android's hardware `MediaCodec` for video and low-latency `AudioTrack` for audio.
 
+```mermaid
+flowchart LR
+    SENDER["Mac, iPhone or iPad<br/>Screen Mirroring or AirPlay"] -- "Wi-Fi, same network" --> CORE["Portal<br/>discovery, pairing, decryption"]
+    CORE --> VIDEO["MediaCodec and SurfaceView<br/>picture on the screen"]
+    CORE --> AUDIO["AudioTrack<br/>sound from the speakers"]
+```
+
+See [the architecture notes](docs/architecture.md) for the details.
+
 ---
 
 ## Security
