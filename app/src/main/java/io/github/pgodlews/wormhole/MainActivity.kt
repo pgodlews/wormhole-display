@@ -1121,7 +1121,7 @@ private fun DashboardScreen(
                             color = Color(0xFFF1F5F9)
                         )
                         Text(
-                            text = "Last 5 sessions",
+                            text = "Last ${ConnectionHistory.MAX_ENTRIES} sessions",
                             fontSize = if (isTvOrCompact) 11.sp else 13.sp,
                             color = Color(0xFF94A3B8)
                         )
