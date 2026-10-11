@@ -38,6 +38,18 @@ object NativeBridge {
 
         /** Unexpected mirror failure; the controller resets the server outside native callbacks. */
         fun onStreamError()
+
+        /** A sender started PIN pairing: show [pin] (4 digits) until it is entered or times out. */
+        fun onDisplayPin(pin: String) {}
+
+        /** A sender completed PIN pairing; remember [publicKey] so it can reconnect without a PIN. */
+        fun onClientPaired(publicKey: String, deviceId: String, name: String) {}
+
+        /**
+         * A returning sender skipped PIN entry while a PIN is required: true admits it.
+         * Called synchronously on the core's HTTP thread; keep it a fast in-memory lookup.
+         */
+        fun isClientPaired(publicKey: String): Boolean = false
     }
 
     /** Audio codec tags shared with wormhole_jni.c (AirPlay "ct" values; 0 = decoded PCM). */
@@ -49,7 +61,10 @@ object NativeBridge {
 
     external fun nativeSetListener(listener: Listener?)
 
-    /** Starts the AirPlay server; returns the RTSP port (7000) or a negative error. */
+    /**
+     * Starts the AirPlay server; returns the RTSP port (7000) or a negative error.
+     * [requirePin] advertises pw=true and admits only senders that pair with an on-screen PIN.
+     */
     external fun nativeStart(
         keyFile: String,
         deviceId: String,
@@ -57,7 +72,8 @@ object NativeBridge {
         width: Int,
         height: Int,
         maxFps: Int,
-        allowHevc: Boolean
+        allowHevc: Boolean,
+        requirePin: Boolean
     ): Int
 
     /** Hex ed25519 public key owned by the server; advertise it as pk=. */

@@ -14,6 +14,7 @@ import android.view.WindowManager
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.getAndUpdate
 import kotlinx.coroutines.flow.update
 import java.io.File
 import java.util.concurrent.Executors
@@ -35,6 +36,7 @@ object WormholeServer {
         private set
     lateinit var history: ConnectionHistory
         private set
+    private lateinit var pairedClients: PairedClients
 
     // State flows observed by UI and Service
     private val _isMirroring = MutableStateFlow(false)
@@ -86,6 +88,22 @@ object WormholeServer {
         _orientationNotice.value = null
     }
 
+    /** A sender is waiting for this PIN to be typed in (PIN pairing). */
+    data class PairingPin(val code: String, val timestamp: Long = System.currentTimeMillis())
+
+    private val _pairingPin = MutableStateFlow<PairingPin?>(null)
+    val pairingPin: StateFlow<PairingPin?> = _pairingPin.asStateFlow()
+
+    private val _pairedClientCount = MutableStateFlow(0)
+    val pairedClientCount: StateFlow<Int> = _pairedClientCount.asStateFlow()
+
+    fun dismissPairingPin() {
+        val shown = _pairingPin.getAndUpdate { null } ?: return
+        if (_statusText.value == pinStatus(shown.code)) _statusText.value = idleStatus
+    }
+
+    private fun pinStatus(code: String) = "AirPlay code: $code"
+
     private var lastRawWidth = 1920
     private var lastRawHeight = 1080
     private var lastFps = 60
@@ -97,6 +115,9 @@ object WormholeServer {
     var hevcEnabled: Boolean = false
         private set
     private val hevcFailedThisProcess = AtomicBoolean(false)
+    /** Senders must pair with an on-screen PIN (once per sender); off = anyone on the LAN can connect. */
+    var pinRequired: Boolean = false
+        private set
     var runInBackground: Boolean = true
         private set
     var startOnBoot: Boolean = true
@@ -157,10 +178,13 @@ object WormholeServer {
         identity = WormholeIdentity(appContext)
         history = ConnectionHistory(appContext)
         _recentConnections.value = history.getRecent()
+        pairedClients = PairedClients(appContext)
+        _pairedClientCount.value = pairedClients.count()
 
         audioEnabled = prefs.getBoolean("audio_enabled", true)
         debugOverlayEnabled = prefs.getBoolean("debug_overlay_enabled", false)
         hevcEnabled = prefs.getBoolean("hevc_enabled", false)
+        pinRequired = prefs.getBoolean("pin_required", false)
         runInBackground = prefs.getBoolean("run_in_background", true)
         startOnBoot = prefs.getBoolean("start_on_boot", true)
 
@@ -201,6 +225,21 @@ object WormholeServer {
         hevcFailedThisProcess.set(false)
         prefs.edit().putBoolean("hevc_enabled", enabled).apply()
         restartServer()
+    }
+
+    /** The TXT records and the core's admission rules change, so the receiver restarts (dropping any sender). */
+    fun setPinRequired(enabled: Boolean) {
+        if (pinRequired == enabled) return
+        pinRequired = enabled
+        prefs.edit().putBoolean("pin_required", enabled).apply()
+        dismissPairingPin()
+        restartServer()
+    }
+
+    /** Every sender must enter a new PIN on its next connection (while a PIN is required). */
+    fun forgetPairedClients() {
+        pairedClients.clear()
+        _pairedClientCount.value = 0
     }
 
     fun setRunInBackground(enabled: Boolean) {
@@ -281,6 +320,7 @@ object WormholeServer {
             start = {
                 val currentDisplay = _displayInfo.value
                 val requestHevc = hevcEnabled
+                val requirePin = pinRequired
                 callbackGeneration.incrementAndGet()
                 val startEvent = mirrorGeneration.incrementAndGet()
                 if (mirrorGeneration.get() == startEvent) {
@@ -299,7 +339,7 @@ object WormholeServer {
                 val port = NativeBridge.nativeStart(
                     keyFile, identity.deviceIdHex, identity.serviceName,
                     currentDisplay.width, currentDisplay.height, currentDisplay.refreshRate,
-                    renderer.hevcDecoder != null
+                    renderer.hevcDecoder != null, requirePin
                 )
                 check(port > 0) { "Server failed to start ($port)" }
                 if (mirrorGeneration.get() == startEvent) {
@@ -336,6 +376,7 @@ object WormholeServer {
         _isMirroring.value = false
         _isAudioStreaming.value = false
         clearNowPlaying()
+        _pairingPin.value = null
         _clientName.value = null
         _statusText.value = "Receiver stopped"
     }
@@ -350,6 +391,7 @@ object WormholeServer {
             _isMirroring.value = false
             _isAudioStreaming.value = false
             clearNowPlaying()
+            _pairingPin.value = null
             _videoAspectRatio.value = null
             _clientName.value = null
             _statusText.value = "Restarting receiver…"
@@ -489,6 +531,7 @@ object WormholeServer {
             // Metadata, art and progress arrive only between these two callbacks.
             clearNowPlaying()
             if (running) {
+                dismissPairingPin()
                 audioRenderer.beginSession(codec)
                 // Audio arriving outside a mirroring session is an AirPlay speaker session
                 // (Music / iTunes on a Mac, or iOS audio-only). Mirroring owns the UI otherwise.
@@ -527,6 +570,7 @@ object WormholeServer {
         override fun onMirrorRunning(running: Boolean) {
             if (!callbacksEnabled.get()) return
             if (running) {
+                dismissPairingPin()
                 sessionStartTime = System.currentTimeMillis()
                 sessionResolution = ""
                 sessionCodec = ""
@@ -556,6 +600,26 @@ object WormholeServer {
         }
 
         override fun onStreamError() = requestReconnect()
+
+        override fun onDisplayPin(pin: String) {
+            if (!callbacksEnabled.get()) return
+            Log.i(TAG, "PIN pairing requested by a sender")
+            _pairingPin.value = PairingPin(pin)
+            if (!_isMirroring.value && !_isAudioStreaming.value) _statusText.value = pinStatus(pin)
+            if (!isActivityResumed) {
+                onIncomingStreamBackgroundCallback?.invoke()
+            }
+        }
+
+        override fun onClientPaired(publicKey: String, deviceId: String, name: String) {
+            // Fires when pair-setup-pin completes (no name yet) and again at SETUP with the sender's name.
+            Log.i(TAG, "Sender paired with PIN: ${name.ifBlank { deviceId }}")
+            pairedClients.add(PairedClient(publicKey, deviceId, name))
+            _pairedClientCount.value = pairedClients.count()
+            dismissPairingPin()
+        }
+
+        override fun isClientPaired(publicKey: String): Boolean = pairedClients.isPaired(publicKey)
     }
 
     private fun queryDisplayInfo(context: Context): DisplayInfo {

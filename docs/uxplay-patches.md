@@ -18,6 +18,8 @@ marked "Android JNI addition").
 | `dnssdint.h` / `mdnsd/dnssd_mdnsd.c` | Advertise `et=0,1` + `ek=1` (RSA) for legacy audio clients. |
 | `global.h` / `mdnsd/dnssd_mdnsd.c` | Advertise an AirPort-Express `am=` on the RAOP record (audio auth selection) while `_airplay` keeps `AppleTV3,2`. |
 | `rsakey.c` / `rsakey.h` (new) | AirPort Express RSA key: Apple-Challenge signing (PKCS#1 v1.5) and rsaaeskey decryption (RSA-OAEP), plus padding-tolerant base64. |
+| `raop_handlers.h` | PIN mode (`use_pin`) enforcement, which upstream's `-pin` lacks: `pair-setup-pin` refuses to start without a code displayed by `/pair-pin-start` (upstream used "0000"); `pair-verify` admits only the key that completed `pair-setup-pin` on this connection or a `check_register` key, and checks *before* the handshake (upstream checked afterwards, so the rejected key could still finish); `SETUP` requires a finished `pair-verify`; `ANNOUNCE` (legacy RAOP, no pairing) is refused. `register_client` also fires when `pair-setup-pin` succeeds (name NULL), not only at `SETUP`, so a sender that verifies on a new connection is recognized. |
+| `pairing.c` / `pairing.h` | `pairing_session_is_verified` and `pairing_session_is_setup_key` helpers for the PIN-mode checks. |
 | `mdnsd/dnssd_mdnsd.c` | Build a unique mDNS hostname from `hwaddr` instead of `gethostname()`, which returns "localhost" on Android and caused LAN collisions and misrouted connections across multiple receivers. |
 
 These are deliberate correctness changes. No upstream-version claim is made;

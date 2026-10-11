@@ -33,6 +33,7 @@ app/src/main/java/io/github/pgodlews/wormhole/
     AudioRenderer.kt                      AAC-ELD decode → AudioTrack
     NowPlaying.kt                         track metadata + extrapolated position for audio-only sessions
     WormholeIdentity.kt                   persisted deviceid, service name, Wi-Fi multicast lock
+    PairedClients.kt                      senders paired via the optional on-screen PIN
 scripts/build.sh                          build APK → dist/wormhole-display.apk
 scripts/build-deps.sh                     rebuild the native deps (rarely needed)
 scripts/test-native.sh                    host regression tests for the vendored mirror loop and the DMAP parser
@@ -72,7 +73,8 @@ Wi-Fi LAN (mDNS does not cross the USB cable; Portal has no ethernet).
    `srcvers=220.68`, `features=0x5A7FFEE6,0x0`. This is what populates the
    sender's picker.
 2. Client connects to TCP 7000, does `GET /info` (RTSP-style, **with CSeq**),
-   then ed25519 `pair-verify` (transient — no PIN with our feature bits).
+   then ed25519 `pair-verify` (transient — no PIN by default; with *Require PIN* a new
+   sender first runs `pair-pin-start` + SRP `pair-setup-pin`, see "PIN pairing" below).
 3. `POST /fp-setup` × 2 — FairPlay SAP handshake (in `playfair/`).
 4. `SETUP` negotiates streams: video over TCP 7100 ("mirror data"), timing/control
    UDP 7011/7001/7101. Then `RECORD` starts the stream.
@@ -179,6 +181,16 @@ adb logcat | grep -E "uxplay|Wormhole|AndroidRuntime|libc"
   stream geometry mid-session, switching orientation disconnects any active mirroring
   client (`disconnectClient("orientation_changed")`) and restarts the native receiver
   to re-advertise transposed dimensions in RTSP `/info`.
+- **PIN pairing**: opt-in (`pin_required` pref, off by default), UxPlay `-pin` mode with a
+  random code per attempt. `display_pin` → `onDisplayPin` shows `PairingPinDialog`;
+  `register_client` → `onClientPaired` stores the sender key in `PairedClients`;
+  `check_register` → `isClientPaired` runs synchronously on the core's HTTP thread and must
+  fail closed. Upstream UxPlay's `-pin` is bypassable (skip pairing before `SETUP`, use
+  "0000" without `pair-pin-start`, finish `pair-verify` after a rejected key, or use legacy
+  `ANNOUNCE`); the vendor patches in `docs/uxplay-patches.md` close those holes, so keep them
+  across upgrades. Changing the setting restarts the receiver because the TXT records change.
+  How Apple senders behave after *Forget All* (rejected `pair-verify` → new PIN prompt)
+  needs checking on a device after sender OS updates.
 - **Package or class renames**: the JNI functions in `wormhole_jni.c`
   (`Java_io_github_pgodlews_wormhole_NativeBridge_*`) and the
   `FindClass("io/github/pgodlews/wormhole/NativeBridge$Listener")` string encode
@@ -240,7 +252,8 @@ device: uninstall first when switching (this resets the receiver identity and th
 - The sender decides mirroring vs extended display, resolution within the
   advertised modes, and codec; the receiver advertises capabilities and renders
   what it is sent.
-- No PIN or password: any device on the LAN can connect. This is intentional.
+- No PIN or password by default: any device on the LAN can connect. *Require PIN* is an
+  opt-in dashboard setting, not the default.
 - macOS/iOS updates can and do break third-party receivers; treat
   `model`/`srcvers`/`features` as moving targets.
 - **GPLv3**: everything here links UxPlay. Never copy code from this repo into
