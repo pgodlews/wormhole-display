@@ -34,7 +34,7 @@ data class ConnectionEntry(
 class ConnectionHistory(context: Context) {
     private val prefs = context.getSharedPreferences("connection_history", Context.MODE_PRIVATE)
 
-    fun getRecent(limit: Int = 5): List<ConnectionEntry> {
+    fun getRecent(limit: Int = MAX_ENTRIES): List<ConnectionEntry> {
         val raw = prefs.getString(KEY_HISTORY, null) ?: return emptyList()
         if (raw.isBlank()) return emptyList()
         return raw.split("\n")
@@ -51,13 +51,14 @@ class ConnectionHistory(context: Context) {
     ) {
         val current = getRecent().toMutableList()
         current.add(0, ConnectionEntry(clientName, timestamp, durationSeconds, resolution, codec))
-        val trimmed = current.take(5)
+        val trimmed = current.take(MAX_ENTRIES)
         val serialized = trimmed.joinToString("\n") { it.serialize() }
         prefs.edit().putString(KEY_HISTORY, serialized).apply()
     }
 
     companion object {
         private const val KEY_HISTORY = "recent_connections"
+        const val MAX_ENTRIES = 10
 
         fun formatDuration(seconds: Long): String {
             return when {
