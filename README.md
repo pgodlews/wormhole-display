@@ -143,7 +143,7 @@ See [the architecture notes](docs/architecture.md) for the details.
 
 ## Security
 
-Wormhole Display accepts screen-mirroring connections from **any device on your local network, without a PIN or password**. Run it only on networks you trust.
+By default, Wormhole Display accepts screen-mirroring connections from **any device on your local network, without a PIN or password**. Run it only on networks you trust, or turn on **Require PIN** in the dashboard: each new device must then enter a 4-digit code shown on the receiver once, the way Apple TV does. Paired devices reconnect without a code until you choose *Forget All*. Legacy AirPlay audio (iTunes and older Macs) is unavailable while a PIN is required.
 
 ---
 

@@ -207,6 +207,28 @@ flowchart TD
     END["Audio session ends"] -. "state and art cleared" .-> NP
 ```
 
+## PIN pairing (optional)
+
+Off by default: any device on the LAN can connect. The dashboard's *Require PIN*
+switch restarts the receiver with `nativeStart(…, requirePin = true)`, which uses
+UxPlay's `-pin` mode: `pw=true` (RAOP `sf=0x8c`) in the TXT records and
+`raop_set_plist(raop, "pin", 0)`, so the core draws a new random code for every pairing attempt.
+
+- **First connection:** the sender sends `POST /pair-pin-start`. The core calls
+  `display_pin`, `WormholeServer` publishes `pairingPin` (brings the app forward like an
+  incoming stream) and `PairingPinDialog` shows the digits for 60 s. The sender completes
+  SRP `pair-setup-pin` with them, then `pair-verify` with the key it just paired. When
+  `pair-setup-pin` succeeds (and again at `SETUP`, with the sender's name), `register_client`
+  hands the sender's ed25519 key to `PairedClients` (SharedPreferences).
+- **Later connections:** the sender goes straight to `pair-verify`. The core asks
+  `check_register` → `isClientPaired(pk)` *before* the handshake and refuses unknown keys.
+  *Forget All* clears the list. The receiver's own key (`server-key.pem`) is persistent,
+  so pairings survive restarts but not a reinstall.
+- **Enforcement** (vendor patches, see `uxplay-patches.md`): `SETUP` requires a finished
+  `pair-verify`, `ANNOUNCE` (legacy RAOP audio, which never pairs) is refused, and
+  `pair-setup-pin` refuses to run without a displayed code. Upstream UxPlay let a client
+  skip each of these.
+
 ## Protocol knobs
 
 Senders change the protocol periodically; the moving knobs are `model`, `srcvers`,
@@ -228,6 +250,7 @@ UxPlay is GPLv3 (its `lib/` mirroring core is LGPLv2.1+; bundled `llhttp` is MIT
 ## Known limitations
 
 - Wi-Fi only; sender and receiver must be on the same LAN (no AWDL).
-- No PIN or password admission: any device on the LAN can connect.
+- By default there is no PIN or password: any device on the LAN can connect. The
+  optional *Require PIN* mode admits only paired senders and turns off legacy RAOP audio.
 - The sender chooses mirroring vs extended display and the codec; advertising
   HEVC support does not force HEVC.
