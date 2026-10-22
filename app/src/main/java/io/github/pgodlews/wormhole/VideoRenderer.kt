@@ -16,9 +16,9 @@ class VideoRenderer(
     private val onVideoSizeChanged: (width: Int, height: Int) -> Unit = { _, _ -> },
     val telemetry: StreamTelemetry = StreamTelemetry()
 ) {
-    // Some devices take ~500 ms to create the surface/decoder. The 12-frame steady
-    // budget alone can discard the startup IDR before the first codec submission.
-    // The 12-frame default is ~0.2 s at 60 fps. A short decoder hiccup (observed when the sender restarts its audio
+    // Some devices take ~500 ms to create the surface/decoder. The steady budget
+    // alone can discard the startup IDR before the first codec submission.
+    // The queue's 12-frame default is ~0.2 s at 60 fps. A short decoder hiccup (observed when the sender restarts its audio
     // stream and an AAC decoder is created next to the video decoder) overflowed it, which discards the decoder and then
     // waits for a keyframe the sender may not send for seconds. 48 frames absorb such a hiccup.
     private val input = VideoFrameQueue(maxFrames = STEADY_QUEUE_FRAMES, startupMaxFrames = 60)
@@ -246,7 +246,10 @@ class VideoRenderer(
     internal companion object {
         const val TAG = "Wormhole"
         const val STEADY_QUEUE_FRAMES = 48
-        /** How long to wait for a keyframe after the queue was reset before giving the session up. */
+        /**
+         * How long the queue may wait for a keyframe after a reset, or hold its oldest frame while the decoder
+         * accepts nothing, before the session is given up. A hung decoder therefore freezes the picture this long.
+         */
         const val STALL_TIMEOUT_NANOS = 5_000_000_000L
 
         fun parseDimensions(hasKey: (String) -> Boolean, getInt: (String) -> Int): Pair<Int, Int> {
