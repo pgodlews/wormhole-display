@@ -18,7 +18,10 @@ class VideoRenderer(
 ) {
     // Some devices take ~500 ms to create the surface/decoder. The 12-frame steady
     // budget alone can discard the startup IDR before the first codec submission.
-    private val input = VideoFrameQueue(startupMaxFrames = 60)
+    // The 12-frame default is ~0.2 s at 60 fps. A short decoder hiccup (observed when the sender restarts its audio
+    // stream and an AAC decoder is created next to the video decoder) overflowed it, which discards the decoder and then
+    // waits for a keyframe the sender may not send for seconds. 48 frames absorb such a hiccup.
+    private val input = VideoFrameQueue(maxFrames = STEADY_QUEUE_FRAMES, startupMaxFrames = 60)
     private val stateLock = Any()
     private var surface: Surface? = null
     private var active = false
@@ -119,7 +122,7 @@ class VideoRenderer(
             decoderPump.tick(generation) {
                 if (now >= nextCreateAttempt) createDecoder(target, snapshot.diagnostics) else null
             }
-            if (input.stalled(now, 2_000_000_000L)) requestReconnect(snapshot.session)
+            if (input.stalled(now, STALL_TIMEOUT_NANOS)) requestReconnect(snapshot.session)
         } catch (e: Exception) {
             Log.w(TAG, "decoder failed; reconnect required: ${e.message}")
             decoderPump.close()
@@ -242,6 +245,9 @@ class VideoRenderer(
 
     internal companion object {
         const val TAG = "Wormhole"
+        const val STEADY_QUEUE_FRAMES = 48
+        /** How long to wait for a keyframe after the queue was reset before giving the session up. */
+        const val STALL_TIMEOUT_NANOS = 5_000_000_000L
 
         fun parseDimensions(hasKey: (String) -> Boolean, getInt: (String) -> Int): Pair<Int, Int> {
             val hasCrop = hasKey("crop-left") && hasKey("crop-right") &&
