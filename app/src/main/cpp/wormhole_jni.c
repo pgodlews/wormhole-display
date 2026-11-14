@@ -382,7 +382,14 @@ static void cb_on_video_rate(void *cls, const float rate) {}
 static void cb_on_video_stop(void *cls) {}
 static void cb_on_video_info(void *cls, playback_info_t *info) {}
 static float cb_on_playlist_remove(void *cls) { return 0.0f; }
-static void cb_video_report_size(void *cls, float *a, float *b, float *c, float *d) {}
+
+/* Diagnostics. The sender announces a size with every parameter packet: a change without a reconnect means it
+ * switched what it puts on this screen (for example from the mirrored phone screen to a full-screen video). */
+static void cb_video_report_size(void *cls, float *width_source, float *height_source, float *width, float *height) {
+    LOGI("[diag] sender-size source=%.0fx%.0f encoded=%.0fx%.0f", *width_source, *height_source, *width, *height);
+}
+static void cb_video_pause(void *cls) { LOGI("[diag] sender-video paused"); }
+static void cb_video_resume(void *cls) { LOGI("[diag] sender-video resumed"); }
 
 JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
     g_vm = vm;
@@ -441,8 +448,8 @@ JNIEXPORT jint Java_io_github_pgodlews_wormhole_NativeBridge_nativeStart(JNIEnv 
     memset(&callbacks, 0, sizeof(callbacks));
     callbacks.audio_process = cb_audio_process;
     callbacks.video_process = cb_video_process;
-    callbacks.video_pause = cb_stub_void;
-    callbacks.video_resume = cb_stub_void;
+    callbacks.video_pause = cb_video_pause;
+    callbacks.video_resume = cb_video_resume;
     callbacks.conn_feedback = cb_stub_void;
     callbacks.conn_reset = cb_conn_reset;
     callbacks.video_reset = cb_video_reset;

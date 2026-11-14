@@ -30,13 +30,16 @@ app/src/main/java/io/github/pgodlews/wormhole/
     NativeBridge.kt                       JNI declarations
     ScreenOrientation.kt                  portrait/landscape/auto orientation modes and model helpers
     VideoFrameQueue.kt, VideoRenderer.kt  compressed-frame queue → MediaCodec → Surface (H.264/HEVC)
+    StreamConfigInspector.kt              diagnostics: parses SPS size/colour from parameter packets into `[diag]` log lines
     AudioRenderer.kt                      AAC-ELD decode → AudioTrack
     NowPlaying.kt                         track metadata + extrapolated position for audio-only sessions
     WormholeIdentity.kt                   persisted deviceid, service name, Wi-Fi multicast lock
 scripts/build.sh                          build APK → dist/wormhole-display.apk
 scripts/build-deps.sh                     rebuild the native deps (rarely needed)
 scripts/test-native.sh                    host regression tests for the vendored mirror loop and the DMAP parser
+scripts/capture-diagnostics.sh            record logcat, markers, screenshots and compositor state over adb
 docs/architecture.md                      design overview
+docs/diagnosing-video.md                  capture procedure and reference for the `[diag]` log lines
 docs/uxplay-patches.md                    inventory of vendored-code changes
 ```
 
@@ -108,6 +111,11 @@ Logs on the device:
 ```bash
 adb logcat | grep -E "uxplay|Wormhole|AndroidRuntime|libc"
 ```
+
+Picture looks wrong (colour, washed-out video, unexpected size changes): record a session with
+`scripts/capture-diagnostics.sh` and read `docs/diagnosing-video.md`. Lines marked `[diag]` describe the sender's
+parameter sets (bit depth, colour range, primaries, transfer), the decoder's output format and the display's HDR
+capabilities. Keep that marker on any diagnostic line you add; the capture script and the docs rely on it.
 
 ## Troubleshooting — every one of these was hit for real
 

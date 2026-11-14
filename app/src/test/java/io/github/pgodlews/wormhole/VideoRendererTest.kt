@@ -64,4 +64,25 @@ class VideoRendererTest {
         assertEquals(0, w)
         assertEquals(0, h)
     }
+
+    @Test
+    fun `describeOutputColour names the decoder colour constants`() {
+        val hlg = mapOf(
+            "width" to 1920, "height" to 1080,
+            "color-standard" to 6, "color-range" to 2, "color-transfer" to 7, "hdr-static-info" to 0
+        )
+        assertEquals(
+            "size=1920x1080 color-standard=6(BT.2020) color-range=2(limited) color-transfer=7(HLG) hdr-static-info=present",
+            VideoRenderer.describeOutputColour({ hlg.containsKey(it) }, { hlg[it] ?: 0 })
+        )
+    }
+
+    @Test
+    fun `describeOutputColour reports keys the decoder left unset`() {
+        val bare = mapOf("width" to 886, "height" to 1920, "color-range" to 1)
+        assertEquals(
+            "size=886x1920 color-standard=unset color-range=1(full) color-transfer=unset hdr-static-info=absent",
+            VideoRenderer.describeOutputColour({ bare.containsKey(it) }, { bare[it] ?: 0 })
+        )
+    }
 }

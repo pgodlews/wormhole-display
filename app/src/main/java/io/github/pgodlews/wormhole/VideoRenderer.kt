@@ -29,6 +29,7 @@ class VideoRenderer(
     private var sessionHevc = false
     private var session = 0L
     private var diagnostics = VideoDiagnostics(session)
+    private val streamConfig = StreamConfigInspector()
     @Volatile internal var hevcDecoder: VideoDecoderSupport.Hevc? = null
     private val worker = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "Wormhole decoder") }
     // Fields below are confined to worker.
@@ -58,6 +59,7 @@ class VideoRenderer(
             input.reset()
             input.resetStatistics()
             diagnostics = VideoDiagnostics(session)
+            streamConfig.reset()
             telemetry.reset()
         }
     }
@@ -78,9 +80,12 @@ class VideoRenderer(
     fun onFrame(data: ByteArray, ingressNanos: Long, ntpLocalNanos: Long, ntpRemoteNanos: Long, hevc: Boolean = false) = synchronized(stateLock) {
         if (active && !closed) {
             sessionHevc = hevc
+            val codec = if (hevc) VideoCodec.HEVC else VideoCodec.AVC
+            // Diagnostics only: what the sender's parameter sets say about size and colour. Never affects playback.
+            runCatching { streamConfig.inspect(data, codec) }.getOrNull()?.forEach { Log.i(TAG, it) }
             val now = System.nanoTime()
             telemetry.onFrameReceived(data.size, now)
-            input.offer(data, now, ntpLocalNanos, ntpRemoteNanos, ingressNanos, if (hevc) VideoCodec.HEVC else VideoCodec.AVC)
+            input.offer(data, now, ntpLocalNanos, ntpRemoteNanos, ingressNanos, codec)
             // Includes JNI allocation/copy, listener dispatch and queue bookkeeping;
             // excludes the few JNI cleanup instructions after Kotlin returns.
             diagnostics.received(data.size, ingressNanos, ntpLocalNanos, ntpRemoteNanos, System.nanoTime())
@@ -229,6 +234,10 @@ class VideoRenderer(
                 index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                     val format = decoder.outputFormat
                     Log.i(TAG, "decoder format: $format")
+                    runCatching {
+                        Log.i(TAG, "${StreamConfigInspector.PREFIX} decoder-output " +
+                            describeOutputColour({ format.containsKey(it) }, { format.getInteger(it) }))
+                    }
                     val (w, h) = parseVideoDimensions(format)
                     if (w > 0 && h > 0 && (w != lastWidth || h != lastHeight)) {
                         lastWidth = w
@@ -271,6 +280,24 @@ class VideoRenderer(
             } else 0
 
             return Pair(width, height)
+        }
+
+        /** Size and colour interpretation the decoder reports for its output, with the MediaFormat constants named. */
+        fun describeOutputColour(hasKey: (String) -> Boolean, getInt: (String) -> Int): String {
+            fun named(key: String, name: (Int) -> String): String {
+                if (!hasKey(key)) return "$key=unset"
+                val value = runCatching { getInt(key) }.getOrNull() ?: return "$key=unreadable"
+                return "$key=$value(${name(value)})"
+            }
+            val (width, height) = parseDimensions(hasKey, getInt)
+            return "size=${width}x$height " +
+                named("color-standard") {
+                    when (it) { 1 -> "BT.709"; 2 -> "BT.601-PAL"; 4 -> "BT.601-NTSC"; 6 -> "BT.2020"; else -> "?" }
+                } + " " +
+                named("color-range") { when (it) { 1 -> "full"; 2 -> "limited"; else -> "?" } } + " " +
+                named("color-transfer") {
+                    when (it) { 1 -> "linear"; 3 -> "SDR"; 6 -> "PQ"; 7 -> "HLG"; else -> "?" }
+                } + " hdr-static-info=" + (if (hasKey("hdr-static-info")) "present" else "absent")
         }
 
         fun parseVideoDimensions(format: MediaFormat): Pair<Int, Int> {

@@ -533,6 +533,8 @@ object WormholeServer {
                 dismissOrientationNotice()
                 renderer.beginSession()
                 audioRenderer.beginSession()
+                // Off this thread: it delivers the stream, and enumerating decoders can take a while.
+                Thread({ logSessionDiagnostics() }, "Wormhole diagnostics").start()
             } else {
                 recordSessionEnd()
                 renderer.endSession()
@@ -556,6 +558,33 @@ object WormholeServer {
         }
 
         override fun onStreamError() = requestReconnect()
+    }
+
+    /**
+     * Diagnostics, once per mirroring session so a capture started at any time contains them: what this build and
+     * device are, what was advertised, and what the panel and decoders can do with HDR or wide-gamut video.
+     */
+    private fun logSessionDiagnostics() {
+        runCatching {
+            val prefix = StreamConfigInspector.PREFIX
+            val version = runCatching {
+                appContext.packageManager.getPackageInfo(appContext.packageName, 0).versionName
+            }.getOrNull()
+            val advertised = _displayInfo.value
+            Log.i(TAG, "$prefix session-start app=$version device=${android.os.Build.MANUFACTURER} " +
+                "${android.os.Build.MODEL} (${android.os.Build.DEVICE}) sdk=${android.os.Build.VERSION.SDK_INT} " +
+                "client=${_clientName.value} advertised=${advertised.width}x${advertised.height}@${advertised.refreshRate} " +
+                "portrait=${_isPortrait.value} hevcSetting=$hevcEnabled hevcDecoder=${renderer.hevcDecoder?.name}")
+            @Suppress("DEPRECATION")
+            val display = (appContext.getSystemService(Context.WINDOW_SERVICE) as? WindowManager)?.defaultDisplay
+            if (display != null) {
+                val hdr = display.hdrCapabilities
+                Log.i(TAG, "$prefix display hdrTypes=${hdr?.supportedHdrTypes?.toList() ?: emptyList<Int>()} " +
+                    "maxLuminance=${hdr?.desiredMaxLuminance} isHdr=${display.isHdr} " +
+                    "wideColorGamut=${display.isWideColorGamut} mode=${display.mode}")
+            }
+            VideoDecoderSupport.describeDecoders().forEach { Log.i(TAG, "$prefix decoder-available $it") }
+        }.onFailure { Log.w(TAG, "session diagnostics failed", it) }
     }
 
     private fun queryDisplayInfo(context: Context): DisplayInfo {
