@@ -142,6 +142,15 @@ class StreamConfigInspectorTest {
         assertTrue(lines.last(), lines.last().endsWith("…(+89 bytes)"))
     }
 
+    @Test fun `a packet stuffed with units is examined and logged only up to a fixed number`() {
+        val stuffed = annexB(*Array(5000) { AVC_PPS })
+        val lines = StreamConfigInspector().inspect(stuffed, VideoCodec.AVC)!!
+        assertTrue(lines[0], lines[0].endsWith(",PPS:6,+more bytes=${stuffed.size}"))
+        assertEquals(13, lines.size) // the header and one line for each of the 12 units examined
+        val exact = StreamConfigInspector().inspect(annexB(*Array(12) { AVC_PPS }), VideoCodec.AVC)!!
+        assertFalse(exact[0], exact[0].contains("+more"))
+    }
+
     private companion object {
         const val AVC_FULL_709_SPS = "67640028acd940e00f1e6f016e02020280000003008000001e078c18cb"
         const val AVC_LIMITED_HLG_SPS = "6764001facd9405005bb016a12241280000003008000001e078c18cb"

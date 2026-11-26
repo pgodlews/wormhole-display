@@ -22,10 +22,14 @@ internal class StreamConfigInspector {
         val first = payloadStart(data, 0) ?: return null
         if (first >= data.size || !isParameterSet(codec, nalType(codec, data[first]))) return null
 
+        // The sender controls these bytes. A real parameter packet holds a handful of units; stop there, so a
+        // crafted packet of thousands cannot make this scan, or the log, grow with its size.
         val units = ArrayList<Nal>()
         var pos = 0
+        var truncated = false
         while (true) {
             val start = payloadStart(data, pos) ?: break
+            if (units.size == MAX_UNITS) { truncated = true; break }
             val next = startCode(data, start)
             val end = if (next < 0) data.size else next
             if (start < end) units += Nal(nalType(codec, data[start]), start, end)
@@ -51,8 +55,8 @@ internal class StreamConfigInspector {
         lastConfig = joined
 
         val tag = "$PREFIX stream-config #${++reports}"
-        val listed = units.take(MAX_LISTED_UNITS).joinToString(",") { "${nalName(codec, it.type)}:${it.end - it.start}" }
-        val more = if (units.size > MAX_LISTED_UNITS) ",+${units.size - MAX_LISTED_UNITS}" else ""
+        val listed = units.joinToString(",") { "${nalName(codec, it.type)}:${it.end - it.start}" }
+        val more = if (truncated) ",+more" else ""
         val lines = ArrayList<String>()
         lines += "$tag ${codecName(codec)} $state nals=$listed$more bytes=${data.size}"
         if (state == "repeated") return lines
@@ -129,7 +133,7 @@ internal class StreamConfigInspector {
     internal companion object {
         /** Marks every line added for diagnostics, in Kotlin and in the JNI shim: `grep -F '[diag]'`. */
         const val PREFIX = "[diag]"
-        private const val MAX_LISTED_UNITS = 12
+        private const val MAX_UNITS = 12
         private const val MAX_HEX_BYTES = 512
         private val HEX = "0123456789abcdef".toCharArray()
 
