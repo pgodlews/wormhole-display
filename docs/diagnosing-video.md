@@ -82,7 +82,7 @@ To watch live: `adb logcat -v time Wormhole:V WormholeServer:V WormholeMark:V ux
 | `[diag] stream-config #N <codec> first\|changed\|repeated` | with every parameter packet | The NAL units in the packet. `changed` means new parameter sets without a reconnect. |
 | `[diag] stream-config #N summary:` | when the sets are new | Parsed SPS: profile, level, chroma, bit depth, size, then the VUI colour description, ending in `=> SDR`, `=> HDR`, `=> WIDE-GAMUT` or `=> 10-BIT`. |
 | `[diag] stream-config #N sps=` / `pps=` / `vps=` / `sei=` | when the sets are new | The raw units in hex, so anything the summary does not cover can be decoded later. |
-| `[diag] decoder-output` | when the decoder's output format changes | Size and the colour standard, range and transfer the decoder reports to the display. |
+| `[diag] decoder-output` | when the decoder's output format changes | Size and the colour standard, range and transfer the decoder reports to the display. A Portal+ decoder attaches `hdr-static-info` to SDR streams too, so only a non-zero (hex) value means HDR metadata. |
 | `[diag] sender-video paused` / `resumed` | when signalled | The sender suspended or resumed the stream (for example a locked phone). |
 | `WormholeMark` | `snap` / `mark` | Where in the log a screenshot or note belongs. |
 

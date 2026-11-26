@@ -236,7 +236,9 @@ class VideoRenderer(
                     Log.i(TAG, "decoder format: $format")
                     runCatching {
                         Log.i(TAG, "${StreamConfigInspector.PREFIX} decoder-output " +
-                            describeOutputColour({ format.containsKey(it) }, { format.getInteger(it) }))
+                            describeOutputColour({ format.containsKey(it) }, { format.getInteger(it) }) {
+                                format.getByteBuffer("hdr-static-info")?.duplicate()?.let { b -> ByteArray(b.remaining()).also(b::get) }
+                            })
                     }
                     val (w, h) = parseVideoDimensions(format)
                     if (w > 0 && h > 0 && (w != lastWidth || h != lastHeight)) {
@@ -282,8 +284,15 @@ class VideoRenderer(
             return Pair(width, height)
         }
 
-        /** Size and colour interpretation the decoder reports for its output, with the MediaFormat constants named. */
-        fun describeOutputColour(hasKey: (String) -> Boolean, getInt: (String) -> Int): String {
+        /**
+         * Size and colour interpretation the decoder reports for its output. The values are the platform's
+         * (stagefright ColorUtils), a superset of the MediaFormat constants: decoders report sRGB as transfer 2,
+         * which the SDK does not name. Some decoders attach HDR static info to every stream, so it only means
+         * HDR when it is not all zero.
+         */
+        fun describeOutputColour(
+            hasKey: (String) -> Boolean, getInt: (String) -> Int, hdrStaticInfo: () -> ByteArray? = { null }
+        ): String {
             fun named(key: String, name: (Int) -> String): String {
                 if (!hasKey(key)) return "$key=unset"
                 val value = runCatching { getInt(key) }.getOrNull() ?: return "$key=unreadable"
@@ -292,12 +301,28 @@ class VideoRenderer(
             val (width, height) = parseDimensions(hasKey, getInt)
             return "size=${width}x$height " +
                 named("color-standard") {
-                    when (it) { 1 -> "BT.709"; 2 -> "BT.601-PAL"; 4 -> "BT.601-NTSC"; 6 -> "BT.2020"; else -> "?" }
+                    when (it) {
+                        0 -> "unspecified"; 1 -> "BT.709"; 2, 3 -> "BT.601-625"; 4, 5 -> "BT.601-525"
+                        6, 7 -> "BT.2020"; 8 -> "BT.470M"; 9 -> "film"; 10 -> "DCI-P3"; else -> "?"
+                    }
                 } + " " +
-                named("color-range") { when (it) { 1 -> "full"; 2 -> "limited"; else -> "?" } } + " " +
+                named("color-range") { when (it) { 0 -> "unspecified"; 1 -> "full"; 2 -> "limited"; else -> "?" } } + " " +
                 named("color-transfer") {
-                    when (it) { 1 -> "linear"; 3 -> "SDR"; 6 -> "PQ"; 7 -> "HLG"; else -> "?" }
-                } + " hdr-static-info=" + (if (hasKey("hdr-static-info")) "present" else "absent")
+                    when (it) {
+                        0 -> "unspecified"; 1 -> "linear"; 2 -> "sRGB"; 3 -> "SDR-video"; 4 -> "gamma2.2"
+                        5 -> "gamma2.8"; 6 -> "PQ"; 7 -> "HLG"; 8 -> "gamma2.6"; else -> "?"
+                    }
+                } + " hdr-static-info=" + when {
+                    !hasKey("hdr-static-info") -> "absent"
+                    else -> {
+                        val info = runCatching(hdrStaticInfo).getOrNull()
+                        when {
+                            info == null -> "present"
+                            info.all { it.toInt() == 0 } -> "all-zero(${info.size} bytes)"
+                            else -> info.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+                        }
+                    }
+                }
         }
 
         fun parseVideoDimensions(format: MediaFormat): Pair<Int, Int> {
