@@ -184,6 +184,8 @@ class MainActivity : ComponentActivity() {
             val displayInfo by WormholeServer.displayInfo.collectAsState()
             val orientationSetting by WormholeServer.orientationSetting.collectAsState()
             val orientationNotice by WormholeServer.orientationNotice.collectAsState()
+            val pairingPin by WormholeServer.pairingPin.collectAsState()
+            val pairedClientCount by WormholeServer.pairedClientCount.collectAsState()
 
             LaunchedEffect(orientationSetting) {
                 updateOrientationMode(orientationSetting)
@@ -192,6 +194,7 @@ class MainActivity : ComponentActivity() {
             var audioEnabled by remember { mutableStateOf(WormholeServer.audioEnabled) }
             var debugOverlayEnabled by remember { mutableStateOf(WormholeServer.debugOverlayEnabled) }
             var hevcEnabled by remember { mutableStateOf(WormholeServer.hevcEnabled) }
+            var pinRequired by remember { mutableStateOf(WormholeServer.pinRequired) }
             var runInBackground by remember { mutableStateOf(WormholeServer.runInBackground) }
             var startOnBoot by remember { mutableStateOf(WormholeServer.startOnBoot) }
             var serviceName by remember { mutableStateOf(WormholeServer.identity.serviceName) }
@@ -275,6 +278,13 @@ class MainActivity : ComponentActivity() {
                                 debugOverlayEnabled = enabled
                                 WormholeServer.setDebugOverlayEnabled(enabled)
                             },
+                            pinRequired = pinRequired,
+                            onPinRequiredChanged = { enabled ->
+                                pinRequired = enabled
+                                WormholeServer.setPinRequired(enabled)
+                            },
+                            pairedClientCount = pairedClientCount,
+                            onForgetPairedClients = { WormholeServer.forgetPairedClients() },
                             runInBackground = runInBackground,
                             onRunInBackgroundChanged = { enabled ->
                                 runInBackground = enabled
@@ -305,6 +315,13 @@ class MainActivity : ComponentActivity() {
                                 onDismiss = { WormholeServer.dismissOrientationNotice() }
                             )
                         }
+                    }
+
+                    pairingPin?.let { pin ->
+                        PairingPinDialog(
+                            pin = pin,
+                            onDismiss = { WormholeServer.dismissPairingPin() }
+                        )
                     }
                 }
             }
@@ -437,6 +454,10 @@ private fun DashboardScreen(
     hevcEnabled: Boolean,
     onHevcEnabledChanged: (Boolean) -> Unit,
     onDebugOverlayEnabledChanged: (Boolean) -> Unit,
+    pinRequired: Boolean,
+    onPinRequiredChanged: (Boolean) -> Unit,
+    pairedClientCount: Int,
+    onForgetPairedClients: () -> Unit,
     runInBackground: Boolean,
     onRunInBackgroundChanged: (Boolean) -> Unit,
     startOnBoot: Boolean,
@@ -947,6 +968,112 @@ private fun DashboardScreen(
                                     vertical = if (isTvOrCompact) 3.dp else 6.dp
                                 )
                             )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(dividerSpacing))
+                    HorizontalDivider(color = Color(0xFF1F3146), thickness = 0.5.dp)
+                    Spacer(modifier = Modifier.height(dividerSpacing))
+
+                    // Row 5b: Require PIN
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .tvFocusable(
+                                shape = RoundedCornerShape(8.dp),
+                                onClick = { onPinRequiredChanged(!pinRequired) }
+                            )
+                            .padding(
+                                horizontal = if (isTvOrCompact) 8.dp else 10.dp,
+                                vertical = if (isTvOrCompact) 1.dp else 6.dp
+                            ),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Require PIN",
+                                fontSize = if (isTvOrCompact) 12.sp else 15.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = Color(0xFFE2E8F0)
+                            )
+                            Text(
+                                text = if (pinRequired)
+                                    "New devices enter a code shown on this screen once. Legacy AirPlay audio (iTunes) is unavailable."
+                                else
+                                    "Off: any device on this network can connect",
+                                fontSize = if (isTvOrCompact) 10.sp else 12.sp,
+                                color = Color(0xFF94A3B8)
+                            )
+                        }
+                        Switch(
+                            checked = pinRequired,
+                            onCheckedChange = null,
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color(0xFF09121E),
+                                checkedTrackColor = Color(0xFF7DE2CE),
+                                uncheckedThumbColor = Color(0xFF94A3B8),
+                                uncheckedTrackColor = Color(0xFF1B2B3E)
+                            ),
+                            modifier = if (isTvOrCompact) Modifier.scale(0.8f) else Modifier
+                        )
+                    }
+
+                    if (pinRequired) {
+                        Spacer(modifier = Modifier.height(dividerSpacing))
+                        HorizontalDivider(color = Color(0xFF1F3146), thickness = 0.5.dp)
+                        Spacer(modifier = Modifier.height(dividerSpacing))
+
+                        // Row 5c: Paired devices
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .tvFocusable(
+                                    shape = RoundedCornerShape(8.dp),
+                                    onClick = if (pairedClientCount > 0) onForgetPairedClients else null
+                                )
+                                .padding(
+                                    horizontal = if (isTvOrCompact) 8.dp else 10.dp,
+                                    vertical = if (isTvOrCompact) 1.dp else 6.dp
+                                ),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Paired Devices",
+                                    fontSize = if (isTvOrCompact) 12.sp else 15.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = Color(0xFFE2E8F0)
+                                )
+                                Text(
+                                    text = when (pairedClientCount) {
+                                        0 -> "No devices paired yet"
+                                        1 -> "1 device connects without a code"
+                                        else -> "$pairedClientCount devices connect without a code"
+                                    },
+                                    fontSize = if (isTvOrCompact) 10.sp else 12.sp,
+                                    color = Color(0xFF94A3B8)
+                                )
+                            }
+                            if (pairedClientCount > 0) {
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    border = BorderStroke(1.dp, Color(0xFF1E5246)),
+                                    color = Color(0xFF0F1A26)
+                                ) {
+                                    Text(
+                                        text = "Forget All",
+                                        fontSize = if (isTvOrCompact) 10.sp else 12.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        color = Color(0xFF94A3B8),
+                                        modifier = Modifier.padding(
+                                            horizontal = if (isTvOrCompact) 8.dp else 12.dp,
+                                            vertical = if (isTvOrCompact) 3.dp else 6.dp
+                                        )
+                                    )
+                                }
+                            }
                         }
                     }
 
@@ -1706,6 +1833,81 @@ private fun OrientationNoticeDialog(
                 )
             ) {
                 Text("OK (${remainingSeconds}s)", fontWeight = FontWeight.SemiBold)
+            }
+        }
+    )
+}
+
+/** The code a sender is asking for during PIN pairing; senders time out on their own, so this does too. */
+@Composable
+private fun PairingPinDialog(
+    pin: WormholeServer.PairingPin,
+    onDismiss: () -> Unit
+) {
+    var remainingSeconds by remember(pin.timestamp) { mutableStateOf(60) }
+
+    LaunchedEffect(pin.timestamp) {
+        remainingSeconds = 60
+        while (remainingSeconds > 0) {
+            delay(1000L)
+            remainingSeconds--
+        }
+        onDismiss()
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Color(0xFF142131),
+        shape = RoundedCornerShape(16.dp),
+        title = {
+            Text(
+                text = "AirPlay Code",
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFFF1F5F9)
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = pin.code.toCharArray().joinToString(" "),
+                    fontSize = 56.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace,
+                    color = Color(0xFF7DE2CE),
+                    textAlign = TextAlign.Center
+                )
+                Text(
+                    text = "Enter this code on your Mac, iPhone or iPad to connect. It is needed only the first time.",
+                    fontSize = 13.sp,
+                    color = Color(0xFF94A3B8),
+                    lineHeight = 18.sp,
+                    textAlign = TextAlign.Center
+                )
+            }
+        },
+        confirmButton = {
+            val hideInteraction = remember { MutableInteractionSource() }
+            val isHideFocused by hideInteraction.collectIsFocusedAsState()
+            Button(
+                onClick = onDismiss,
+                interactionSource = hideInteraction,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (isHideFocused) Color(0xFF9EFFEB) else Color(0xFF7DE2CE),
+                    contentColor = Color(0xFF09121E)
+                ),
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.border(
+                    if (isHideFocused) 2.dp else 0.dp,
+                    Color.White,
+                    RoundedCornerShape(10.dp)
+                )
+            ) {
+                Text("Hide (${remainingSeconds}s)", fontWeight = FontWeight.SemiBold)
             }
         }
     )

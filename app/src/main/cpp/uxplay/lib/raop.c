@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
+#include <time.h>
 
 #include "raop.h"
 #include "raop_rtp.h"
@@ -79,6 +80,10 @@ struct raop_s {
      /* for temporary storage of pin during pair-pin start */
     unsigned short pin;
     bool use_pin;
+    /* Android port: a displayed random PIN accepts a few attempts within a time window, because
+     * iOS retypes a wrong code in the same prompt without a new /pair-pin-start. */
+    unsigned char pin_attempts;
+    uint64_t pin_shown_ns;
   
      /* public key as string */
     char pk_str[2*ED25519_KEY_SIZE + 1];
@@ -658,6 +663,8 @@ raop_init(raop_callbacks_t *callbacks) {
     /* initialise stored pin */
     raop->pin = 0;
     raop->use_pin = false;
+    raop->pin_attempts = 0;
+    raop->pin_shown_ns = 0;
 
     /* initialize switch for display of client's streaming data records */    
     raop->clientFPSdata = 0;

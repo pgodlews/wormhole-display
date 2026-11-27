@@ -248,6 +248,20 @@ raop_handler_info(raop_conn_t *conn,
     http_response_add_header(response, "Content-Type", "application/x-apple-binary-plist");
 }
 
+/* Android port: how long, and for how many tries, a displayed random PIN stays valid. iOS lets the
+ * user retype a wrong code in the same prompt and sends pair-setup-pin again without a new
+ * /pair-pin-start, so a PIN used up by its first attempt refused every retry, even the right code.
+ * The window matches the app's on-screen code (hidden after 60 s). */
+#define PIN_MAX_ATTEMPTS 3
+#define PIN_VALID_NS (60ULL * SECOND_IN_NSECS)
+
+static uint64_t
+pin_monotonic_ns(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t) now.tv_sec * SECOND_IN_NSECS + (uint64_t) now.tv_nsec;
+}
+
 static void
 raop_handler_pairpinstart(raop_conn_t *conn,
                           http_request_t *request, http_response_t *response,
@@ -263,6 +277,8 @@ raop_handler_pairpinstart(raop_conn_t *conn,
             logger_log(raop->logger, LOGGER_ERR, "Failed to generate random pin");
         } else {
             raop->pin = (unsigned short) pin_4 % 10000;
+            raop->pin_attempts = 0;
+            raop->pin_shown_ns = pin_monotonic_ns();
         }
     }
     char pin[6] = { '\0' };
@@ -324,12 +340,31 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
         }
         plist_mem_free(method);
         method = NULL;
+        /* Android port: a random PIN exists only after /pair-pin-start displayed it (random_pin() is
+         * 1-9999; fixed PINs are stored as 10000 + nnnn). Upstream otherwise built the SRP verifier
+         * from "0000" here, so a client could pair without the on-screen code. */
+        if (raop->pin == 0) {
+            logger_log(raop->logger, LOGGER_ERR, "pair-setup-pin without a displayed PIN (no /pair-pin-start)");
+            plist_free(req_root_node);
+            goto authentication_failed;
+        }
+        if (raop->pin < 10000) {
+            uint64_t age_ns = pin_monotonic_ns() - raop->pin_shown_ns;
+            if (raop->pin_attempts >= PIN_MAX_ATTEMPTS || age_ns > PIN_VALID_NS) {
+                logger_log(raop->logger, LOGGER_ERR,
+                           "pair-setup-pin: displayed PIN expired (%d attempts, %llu s); the sender must start again",
+                           (int) raop->pin_attempts, (unsigned long long) (age_ns / SECOND_IN_NSECS));
+                raop->pin = 0;
+                plist_free(req_root_node);
+                goto authentication_failed;
+            }
+            raop->pin_attempts++;
+            logger_log(raop->logger, LOGGER_INFO, "pair-setup-pin: attempt %d of %d with the displayed PIN",
+                       (int) raop->pin_attempts, PIN_MAX_ATTEMPTS);
+        }
         plist_get_string_val(req_user_node, &user);
         logger_log(raop->logger, LOGGER_INFO, "pair-setup-pin:  device_id = %s", user);
         snprintf(pin, 6, "%04u", raop->pin % 10000);
-        if (raop->pin < 10000) {
-            raop->pin = 0;
-        }
         int ret = srp_new_user(conn->session, raop->pairing, (const char *) user,
                                (const char *) pin, &salt, &len_salt, &pk, &len_pk);
         plist_mem_free(user);
@@ -417,7 +452,23 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
         } else {
             logger_log(raop->logger, LOGGER_DEBUG, "pair-pin-setup success\n");
         }
+        /* Android port: a random PIN is used up once a sender has paired with it. */
+        if (raop->pin < 10000) {
+            raop->pin = 0;
+        }
         pairing_session_set_setup_status(conn->session);
+        /* Android port: register the PIN-paired key now rather than only at SETUP, so a sender that
+         * runs pair-verify on a new connection is still recognized. SETUP registers it again with
+         * the sender's name. */
+        if (raop->callbacks.register_client) {
+            char *client_device_id = NULL;
+            char *client_pk = NULL;
+            get_pairing_session_client_data(conn->session, &client_device_id, &client_pk);
+            if (client_pk) {
+                raop->callbacks.register_client(raop->callbacks.cls, client_device_id, client_pk, NULL);
+                free(client_pk);
+            }
+        }
         plist_t res_root_node = plist_new_dict();
         plist_t res_epk_node = plist_new_data((const char *) epk, 32);
         plist_t res_authtag_node = plist_new_data((const char *) authtag, 16);
@@ -475,6 +526,11 @@ raop_handler_pairverify(raop_conn_t *conn,
             return;
         }
     }
+    /* Android port: in PIN mode every pair-verify is admission-checked, not only one that skipped
+     * pair-setup: otherwise a legacy /pair-setup reaches the handshake unchecked. */
+    if (raop->use_pin) {
+        register_check = true;
+    }
     unsigned char public_key[X25519_KEY_SIZE];
     unsigned char signature[PAIRING_SIG_SIZE];
     const unsigned char *data = NULL;
@@ -491,6 +547,24 @@ raop_handler_pairverify(raop_conn_t *conn,
             logger_log(raop->logger, LOGGER_ERR, "Invalid pair-verify data");
             return;
         }
+        /* Android port: admit the client BEFORE the handshake. Upstream checked afterwards, leaving
+         * the session in HANDSHAKE with the rejected key, so the signature step could still finish
+         * pair-verify. The key that completed pair-setup-pin on this connection is admitted directly. */
+        if (register_check) {
+            const unsigned char *pk = data + 4 + X25519_KEY_SIZE;
+            bool registered_client = pairing_session_is_setup_key(conn->session, pk);
+            if (!registered_client && raop->callbacks.check_register) {
+                char *pk64 = NULL;
+                ed25519_pk_to_base64(pk, &pk64);
+                registered_client = raop->callbacks.check_register(raop->callbacks.cls, pk64);
+                free (pk64);
+            }
+
+            if (!registered_client) {
+                logger_log(raop->logger, LOGGER_INFO, "pair-verify: client is not PIN-paired");
+                return;
+            }
+        }
         /* We can fall through these errors, the result will just be garbage... */
         if (pairing_session_handshake(conn->session, data + 4, data + 4 + X25519_KEY_SIZE)) {
             logger_log(raop->logger, LOGGER_ERR, "Error initializing pair-verify handshake");
@@ -500,20 +574,6 @@ raop_handler_pairverify(raop_conn_t *conn,
         }
         if (pairing_session_get_signature(conn->session, signature)) {
             logger_log(raop->logger, LOGGER_ERR, "Error getting ED25519 signature");
-        }
-        if (register_check) {
-            bool registered_client = true;
-            if (raop->callbacks.check_register) {
-                const unsigned char *pk = data + 4 + X25519_KEY_SIZE;
-                char *pk64 = NULL;
-                ed25519_pk_to_base64(pk, &pk64);
-                registered_client = raop->callbacks.check_register(raop->callbacks.cls, pk64);
-                free (pk64);
-            }
-
-            if (!registered_client) {
-                return;
-            }
         }
         *response_data = calloc(1, sizeof(public_key) + sizeof(signature));
         if (*response_data) {
@@ -620,6 +680,13 @@ raop_handler_announce(raop_conn_t *conn,
     int data_len = 0;
     const char *data = http_request_get_data(request, &data_len);
     const char *content_type = http_request_get_header(request, "Content-Type");
+
+    /* Android port: legacy RAOP senders do not pair, so PIN mode refuses them */
+    if (raop->use_pin) {
+        logger_log(raop->logger, LOGGER_INFO, "ANNOUNCE refused: legacy RAOP audio is unavailable while a PIN is required");
+        http_response_init(response, "RTSP/1.0", 403, "Forbidden");
+        return;
+    }
 
     if (!data || data_len <= 0 || !content_type || strcmp(content_type, "application/sdp")) {
         logger_log(raop->logger, LOGGER_ERR, "ANNOUNCE without an SDP body");
@@ -799,6 +866,15 @@ raop_handler_setup(raop_conn_t *conn,
     const char *data = NULL;
     int data_len = 0;
     data = http_request_get_data(request, &data_len);
+
+    /* Android port: in PIN mode streams are set up only on a connection that completed pair-verify
+     * with a PIN-paired key. Upstream also accepted clients that skipped pairing altogether (the
+     * unhashed-aeskey path below). */
+    if (raop->use_pin && !pairing_session_is_verified(conn->session)) {
+        logger_log(raop->logger, LOGGER_ERR, "SETUP refused: PIN pairing required");
+        http_response_init(response, "RTSP/1.0", 470, "Connection Authorization Required");
+        return;
+    }
 
     dacp_id = http_request_get_header(request, "DACP-ID");
     active_remote_header = http_request_get_header(request, "Active-Remote");
