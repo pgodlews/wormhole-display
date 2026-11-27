@@ -140,7 +140,7 @@ class VideoFrameQueueTest {
 
     @Test fun `renderer queue absorbs a decoder hiccup of under a second at 60 fps`() {
         val frame = 16_666_667L
-        val q = VideoFrameQueue(maxFrames = VideoRenderer.STEADY_QUEUE_FRAMES, startupMaxFrames = 60)
+        val q = VideoFrameQueue(maxFrames = VideoRenderer.STEADY_QUEUE_FRAMES, startupMaxFrames = VideoRenderer.STEADY_QUEUE_FRAMES)
         q.offer(config + nal(5), 0)
         q.consumed(q.peek()!!) // past startup: the steady limit applies
         val generation = q.currentGeneration()

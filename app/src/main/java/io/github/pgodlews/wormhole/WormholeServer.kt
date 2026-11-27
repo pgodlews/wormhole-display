@@ -129,7 +129,8 @@ object WormholeServer {
     private var sessionCodec: String = ""
     private var audioSessionStartTime = 0L
 
-    // Renderers
+    // Renderers, presenting audio and video against one clock
+    private val avSync = AvSync()
     val renderer = VideoRenderer(
         reconnectRequired = { requestReconnect() },
         onHevcFailure = {
@@ -141,9 +142,10 @@ object WormholeServer {
             if (w > 0 && h > 0) {
                 sessionResolution = "$w × $h"
             }
-        }
+        },
+        sync = avSync
     )
-    val audioRenderer = AudioRenderer(renderer.telemetry)
+    val audioRenderer = AudioRenderer(renderer.telemetry, avSync)
 
     // Activity state
     @Volatile

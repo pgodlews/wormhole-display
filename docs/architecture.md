@@ -180,6 +180,32 @@ flowchart LR
     JNI --> AR["AudioRenderer<br/>AAC-ELD decoded here, PCM sent straight to AudioTrack"]
 ```
 
+## Audio/video sync
+
+The core stamps every audio packet and video frame with the sender's NTP time, converted
+to the device's wall clock. `AvSync` presents both streams at that timestamp plus one
+shared latency, so sound and picture captured together are heard and seen together.
+
+- **Latency.** The smallest value both pipelines can meet: for audio, how late its packets
+  arrive plus the measured time from the `AudioTrack` to the speaker
+  (`AudioTrack.getTimestamp`); for video, how late its frames arrive plus a decode budget.
+  Lateness is a percentile over half-second buckets, so a Wi-Fi stall or the stale packets
+  a sender flushes when its audio restarts do not move it.
+- **Audio.** AAC-ELD is decoded on arrival and the PCM waits until it is due. The track is
+  kept running on silence from the start of the session, so the first sound lands on time.
+  After that audio is never re-timed with a gap: when it is off its target it is resampled
+  to play up to 3 % faster or slower until it is back, and only audio more than 200 ms
+  late is skipped.
+- **Video.** Compressed frames wait in `VideoFrameQueue` until shortly before they are due
+  and are released with a render time (`releaseOutputBuffer(index, renderTimeNs)`). Video
+  follows the audio as actually heard, so lips stay in sync while audio converges. Without
+  audio, frames are shown as soon as they are decoded.
+
+Decoded ALAC from audio-only senders keeps its own pacing by presentation time.
+`AudioRenderer` and `VideoRenderer` each log an `av_sync` line every five seconds;
+`heardMinusTs` and `shownMinusTs` are the two streams' offsets from the sender's
+timestamps and match when they are in sync.
+
 ## Now-playing data
 
 The shim parses or forwards the track info, cover art and progress that the sender

@@ -14,14 +14,18 @@ class VideoRenderer(
     private val reconnectRequired: () -> Unit,
     private val onHevcFailure: () -> Unit = {},
     private val onVideoSizeChanged: (width: Int, height: Int) -> Unit = { _, _ -> },
-    val telemetry: StreamTelemetry = StreamTelemetry()
+    val telemetry: StreamTelemetry = StreamTelemetry(),
+    /** Shared A/V clock; null shows every frame as soon as it is decoded. */
+    private val sync: AvSync? = null
 ) {
     // Some devices take ~500 ms to create the surface/decoder. The steady budget
     // alone can discard the startup IDR before the first codec submission.
     // The queue's 12-frame default is ~0.2 s at 60 fps. A short decoder hiccup (observed when the sender restarts its audio
     // stream and an AAC decoder is created next to the video decoder) overflowed it, which discards the decoder and then
     // waits for a keyframe the sender may not send for seconds. 48 frames absorb such a hiccup.
-    private val input = VideoFrameQueue(maxFrames = STEADY_QUEUE_FRAMES, startupMaxFrames = 60)
+    // Holding frames for lip sync (up to AvSync.MAX_VIDEO_LATENCY_NS) keeps more of them queued, so the queue's
+    // limits cover that hold on top of the hiccup margin.
+    private val input = VideoFrameQueue(maxFrames = STEADY_QUEUE_FRAMES, startupMaxFrames = STEADY_QUEUE_FRAMES)
     private val stateLock = Any()
     private var surface: Surface? = null
     private var active = false
@@ -45,6 +49,14 @@ class VideoRenderer(
     private var lastWidth = 0
     private var lastHeight = 0
     private val info = MediaCodec.BufferInfo()
+    /** Render time (System.nanoTime) of each submitted frame, by its codec timestamp; worker-confined. */
+    private val renderTimes = RenderSchedule()
+    /** Since the last av_sync line: scheduled frames' (render time − timestamp), and how many were released late. */
+    private var shownOffsetSum = 0L
+    private var shownCount = 0
+    private var lateReleases = 0
+    private var immediateReleases = 0
+    private var lastSyncLog = 0L
     private val pump = worker.scheduleWithFixedDelay({ tick() }, 0, 4, TimeUnit.MILLISECONDS)
 
     fun setSurface(value: Surface?) = synchronized(stateLock) {
@@ -65,6 +77,7 @@ class VideoRenderer(
             diagnostics = VideoDiagnostics(session)
             streamConfig.reset()
             telemetry.reset()
+            sync?.resetVideo()
         }
     }
 
@@ -89,6 +102,7 @@ class VideoRenderer(
             // and colour. Never affects playback.
             runCatching { streamConfig.inspect(data, codec) }.getOrNull()?.forEach { Log.i(TAG, it) }
             val now = System.nanoTime()
+            sync?.onVideoArrival(ntpLocalNanos, now + WallClock.realMinusMono())
             telemetry.onFrameReceived(data.size, now)
             input.offer(data, now, ntpLocalNanos, ntpRemoteNanos, ingressNanos, codec)
             // Includes JNI allocation/copy, listener dispatch and queue bookkeeping;
@@ -126,10 +140,16 @@ class VideoRenderer(
             }
             lastLog = now
         }
+        if (sync != null && snapshot.active && now - lastSyncLog >= 5_000_000_000L) {
+            lastSyncLog = now
+            val shown = if (shownCount > 0) "%.1f".format(shownOffsetSum / shownCount / 1e6) else "-"
+            Log.i(TAG, "av_sync video shownMinusTs=${shown}ms scheduled=$shownCount late=$lateReleases immediate=$immediateReleases")
+            shownOffsetSum = 0L; shownCount = 0; lateReleases = 0; immediateReleases = 0
+        }
         val target = snapshot.surface ?: return
         if (!snapshot.active || !target.isValid) return
         try {
-            decoderPump.tick(generation) {
+            decoderPump.tick(generation, ready = ::dueForDecode) {
                 if (now >= nextCreateAttempt) createDecoder(target, snapshot.diagnostics) else null
             }
             if (input.stalled(now, STALL_TIMEOUT_NANOS)) requestReconnect(snapshot.session)
@@ -139,6 +159,29 @@ class VideoRenderer(
             requestReconnect(snapshot.session)
         }
     }
+
+    /**
+     * With a shared A/V clock a frame is decoded shortly before it is due, so the decoder never holds more
+     * than a frame or two of finished pictures (its output buffers are few), and the wait happens on the
+     * compressed queue instead. The render time is attached when it is submitted.
+     */
+    private fun dueForDecode(frame: VideoFrameQueue.Frame): Boolean {
+        val clock = sync ?: return true
+        val realMinusMono = WallClock.realMinusMono()
+        val nowMono = System.nanoTime()
+        val presentAt = clock.videoPresentAt(frame.ntpLocalNanos, nowMono + realMinusMono) ?: return true.also {
+            pendingRender = 0L
+        }
+        val renderAt = presentAt - realMinusMono
+        if (renderAt - DECODE_LEAD_NANOS > nowMono) return false
+        pendingRender = renderAt
+        shownOffsetSum += presentAt - frame.ntpLocalNanos
+        shownCount++
+        return true
+    }
+
+    /** Render time chosen by [dueForDecode] for the frame about to be submitted (0: as soon as decoded). */
+    private var pendingRender = 0L
 
     private fun requestReconnect(expectedSession: Long) {
         var failedHevc = false
@@ -201,6 +244,7 @@ class VideoRenderer(
                         check(capacity >= frame.bytes.size) { "Access unit exceeds codec input capacity ($capacity < ${frame.bytes.size})" }
                         buffer.put(frame.bytes)
                         started.queueInputBuffer(index, 0, frame.bytes.size, frame.receivedNanos / 1000, 0)
+                        renderTimes.submitted(frame.receivedNanos / 1000, pendingRender)
                         val submittedAt = System.nanoTime()
                         measurements.inputAttempt(submittedAt - before, capacity)
                         measurements.submitted(frame, submittedAt)
@@ -210,6 +254,7 @@ class VideoRenderer(
                 override fun close() {
                     runCatching { started.stop() }
                     runCatching { started.release() }
+                    renderTimes.clear()
                     measurements.codecClosed()
                 }
             }
@@ -230,7 +275,14 @@ class VideoRenderer(
             when {
                 index >= 0 -> {
                     val available = System.nanoTime()
-                    decoder.releaseOutputBuffer(index, render)
+                    val renderAt = renderTimes.take(info.presentationTimeUs)
+                    if (render && renderAt > available + RENDER_AHEAD_MIN_NANOS && renderAt - available < RENDER_AHEAD_MAX_NANOS) {
+                        // SurfaceFlinger shows the picture at renderAt, in step with the audio.
+                        decoder.releaseOutputBuffer(index, renderAt)
+                    } else {
+                        if (renderAt != 0L) lateReleases++ else immediateReleases++
+                        decoder.releaseOutputBuffer(index, render)
+                    }
                     val releasedAt = System.nanoTime()
                     measurements.output(info.presentationTimeUs, render, available, releasedAt)
                     // This counts release-to-surface requests, not physical panel presentation.
@@ -261,7 +313,12 @@ class VideoRenderer(
 
     internal companion object {
         const val TAG = "Wormhole"
-        const val STEADY_QUEUE_FRAMES = 48
+        const val STEADY_QUEUE_FRAMES = 96
+        /** A frame is submitted this long before it is due: decode plus hand-off take 20–30 ms on Portal+. */
+        const val DECODE_LEAD_NANOS = 40_000_000L
+        /** Render times closer than this are shown at once; further than the maximum are not trusted. */
+        const val RENDER_AHEAD_MIN_NANOS = 2_000_000L
+        const val RENDER_AHEAD_MAX_NANOS = 1_000_000_000L
         /**
          * How long the queue may wait for a keyframe after a reset, or hold its oldest frame while the decoder
          * accepts nothing, before the session is given up. A hung decoder therefore freezes the picture this long.
@@ -337,4 +394,35 @@ class VideoRenderer(
             )
         }
     }
+}
+
+/** Codec timestamp → render time of submitted frames, in decode order. Output that was dropped is skipped. */
+internal class RenderSchedule(private val capacity: Int = 64) {
+    private val pts = LongArray(capacity)
+    private val renderAt = LongArray(capacity)
+    private var head = 0
+    private var size = 0
+
+    fun submitted(ptsUs: Long, renderAtNanos: Long) {
+        if (size == capacity) { head = (head + 1) % capacity; size-- }
+        val i = (head + size) % capacity
+        pts[i] = ptsUs
+        renderAt[i] = renderAtNanos
+        size++
+    }
+
+    /** Render time for output [ptsUs], or 0 (show at once) when it was not scheduled. */
+    fun take(ptsUs: Long): Long {
+        while (size > 0) {
+            val p = pts[head]
+            val r = renderAt[head]
+            if (p > ptsUs) return 0L
+            head = (head + 1) % capacity
+            size--
+            if (p == ptsUs) return r
+        }
+        return 0L
+    }
+
+    fun clear() { head = 0; size = 0 }
 }

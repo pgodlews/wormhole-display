@@ -2,6 +2,7 @@ package io.github.pgodlews.wormhole
 
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioTimestamp
 import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
@@ -13,7 +14,16 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.math.pow
 
-class AudioRenderer(private val telemetry: StreamTelemetry? = null) {
+/**
+ * Plays the session's audio. Decoded ALAC (audio-only senders) is paced by its presentation time in
+ * [pcmDue]. AAC-ELD (mirroring, iOS audio) is decoded as it arrives and the PCM waits in [pendingPcm]; it is
+ * heard at its sender timestamp plus the latency shared with video ([sync]). The track is kept running on
+ * silence from the start of the session, so the first sound lands on its presentation time. After that audio
+ * is never stopped to be re-timed: when it is off its presentation time it is played up to 3 % faster or
+ * slower until it is back ([PcmStretcher]), and only audio that is hopelessly late is skipped. Without usable
+ * timestamps it plays as it arrives, with the track kept lightly filled.
+ */
+class AudioRenderer(private val telemetry: StreamTelemetry? = null, private val sync: AvSync? = null) {
     private val stateLock = Any()
     private var active = false
     private var closed = false
@@ -27,7 +37,35 @@ class AudioRenderer(private val telemetry: StreamTelemetry? = null) {
     private var decoder: MediaCodec? = null
     private var audioTrack: AudioTrack? = null
     private val bufferInfo = MediaCodec.BufferInfo()
-    private var pcmBuffer = ByteArray(4096)
+    private class PcmChunk(val data: ByteArray, val ntpReal: Long)
+    private val pendingPcm = ArrayDeque<PcmChunk>()
+    private val timestamp = AudioTimestamp()
+    private var trackCapacityFrames = 0L
+    /** Output-path latency below the track (smoothed), and the fill kept in the track against underruns. */
+    private var outputPathNs = AvSync.DEFAULT_AUDIO_OUTPUT_NS - DEFAULT_SAFETY_NS
+    private var safetyNs = DEFAULT_SAFETY_NS
+    private var lastUnderruns = 0
+    private var lastQueuedFrames = 0L
+    private var lastHead = -1L
+    private var headMovedAt = 0L
+    private var syncDropped = 0L
+    private var silenceFrames = 0L
+    private var lastSyncLog = 0L
+    /** Mean of (when a chunk is heard − its timestamp) over the chunks written since the last log line. */
+    private var heardOffsetSum = 0L
+    private var heardOffsetCount = 0
+    private val stretcher = PcmStretcher()
+    /** Smoothed (heard − presentation time) of the audio being written, and the speed that corrects it. */
+    private var errorNs = 0L
+    private var speed = 1.0
+    private var minSpeed = 1.0
+    private var maxSpeed = 1.0
+    /** Skipping hopelessly late audio until it is nearly on time again. */
+    private var skipping = false
+    /** The last thing written to the track was audio (not silence): it must continue without a gap. */
+    private var tailIsAudio = false
+    /** A decoded-ALAC packet was seen: this session is paced by [pcmDue], without keep-alive silence. */
+    @Volatile private var sawPcm = false
 
     private val pump = worker.scheduleWithFixedDelay({ tick() }, 0, 5, TimeUnit.MILLISECONDS)
 
@@ -40,6 +78,7 @@ class AudioRenderer(private val telemetry: StreamTelemetry? = null) {
     // PCM pacing state, confined to the worker thread
     private var pcmFramesWritten = 0L
     private var droppedLate = 0
+    private var silence = ByteArray(0)
 
     var audioEnabled: Boolean = true
         set(value) = synchronized(stateLock) {
@@ -73,6 +112,8 @@ class AudioRenderer(private val telemetry: StreamTelemetry? = null) {
         fedFrames = 0L
         droppedLate = 0
         frameQueue.clear()
+        sawPcm = false
+        sync?.resetAudio()
         telemetry?.onAudioStateChanged(enabled = audioEnabled, active = true)
         if (audioEnabled) {
             worker.execute { setupSession() }
@@ -96,7 +137,8 @@ class AudioRenderer(private val telemetry: StreamTelemetry? = null) {
                 Log.i(TAG, "Audio frame #$loggedFrames: size=${data.size}, ct=$ct, ts=$ntpTimestamp")
                 loggedFrames++
             }
-            // Mirroring audio is played as it arrives, so keep only ~320 ms to bound latency.
+            if (ct == NativeBridge.CT_PCM) sawPcm = true else sync?.onAudioArrival(ntpTimestamp, WallClock.nowReal())
+            // Compressed AAC is decoded within a tick or two, so this bound only matters if the decoder stalls.
             // Audio-only senders (Music / iTunes) stream about two seconds ahead of the
             // presentation time and rely on the receiver to hold the packets until then.
             val limit = if (ct == NativeBridge.CT_PCM) MAX_PCM_QUEUE_SIZE else MAX_QUEUE_SIZE
@@ -120,14 +162,17 @@ class AudioRenderer(private val telemetry: StreamTelemetry? = null) {
     fun flush() = synchronized(stateLock) {
         frameQueue.clear()
         worker.execute {
+            pendingPcm.clear()
             runCatching { decoder?.flush() }
             audioTrack?.let { track ->
                 // AudioTrack.flush() is a no-op while playing
                 runCatching { track.pause() }
                 runCatching { track.flush() }
                 pcmFramesWritten = 0L
+                resetAacState()
                 if (synchronized(stateLock) { active && !closed && audioEnabled }) {
                     runCatching { track.play() }
+                    primeTrack(track)
                 }
             }
         }
@@ -156,12 +201,36 @@ class AudioRenderer(private val telemetry: StreamTelemetry? = null) {
         if (audioTrack?.playState != AudioTrack.PLAYSTATE_PLAYING) {
             pcmFramesWritten = 0L
             runCatching { audioTrack?.play() }
+            audioTrack?.let { primeTrack(it) }
         }
+        lastUnderruns = runCatching { audioTrack?.underrunCount ?: 0 }.getOrDefault(0)
+        resetAacState()
+        syncDropped = 0L
+        silenceFrames = 0L
         // The AAC-ELD decoder is created lazily on the first compressed frame; PCM
         // (decoded ALAC from Music / iTunes) sessions never need it.
     }
 
+    /**
+     * A streaming AudioTrack starts playing (and restarts after AudioFlinger dropped it for underrunning)
+     * only once its buffer is full. Fill it with silence so it runs before the first sound is due.
+     */
+    private fun primeTrack(track: AudioTrack) {
+        val head = track.playbackHeadPosition.toLong() and 0xffffffffL
+        writeSilence(track, trackCapacityFrames - (pcmFramesWritten - head))
+    }
+
+    private fun resetAacState() {
+        lastHead = -1L
+        stretcher.reset()
+        errorNs = 0L
+        speed = 1.0
+        skipping = false
+        tailIsAudio = false
+    }
+
     private fun teardownSession() {
+        pendingPcm.clear()
         runCatching {
             decoder?.stop()
             decoder?.release()
@@ -180,7 +249,9 @@ class AudioRenderer(private val telemetry: StreamTelemetry? = null) {
                 AudioFormat.CHANNEL_OUT_STEREO,
                 AudioFormat.ENCODING_PCM_16BIT
             )
-            val bufferSize = maxOf(minBufferSize * 4, 16384)
+            // AAC is written only when due, so the fill (and the latency) is set by the sync logic, not by this
+            // capacity; it only needs room for that fill plus a burst. ALAC is paced the same way by pcmDue.
+            val bufferSize = maxOf(minBufferSize * 2, TRACK_CAPACITY_BYTES)
             audioTrack = AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
@@ -198,7 +269,8 @@ class AudioRenderer(private val telemetry: StreamTelemetry? = null) {
                 .setBufferSizeInBytes(bufferSize)
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
-            Log.i(TAG, "AudioTrack initialized (buffer size: $bufferSize)")
+            trackCapacityFrames = (audioTrack?.bufferSizeInFrames ?: (bufferSize / PCM_FRAME_BYTES)).toLong()
+            Log.i(TAG, "AudioTrack initialized (buffer size: $bufferSize, $trackCapacityFrames frames)")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to initialize AudioTrack: ${e.message}", e)
         }
@@ -246,71 +318,64 @@ class AudioRenderer(private val telemetry: StreamTelemetry? = null) {
             writePcm(head, currentTrack)
         }
 
-        val packet = synchronized(stateLock) {
-            if (frameQueue.peekFirst()?.ct == NativeBridge.CT_PCM) null else frameQueue.pollFirst()
+        // AAC: feed the decoder as packets arrive; the PCM waits in pendingPcm until it is due.
+        var fed = 0
+        while (fed < MAX_AAC_INPUTS_PER_TICK) {
+            val packet = synchronized(stateLock) {
+                frameQueue.peekFirst()?.takeIf { it.ct != NativeBridge.CT_PCM }
+            } ?: break
+            if (decoder == null) decoder = createAacDecoder()
+            val currentDecoder = decoder ?: break
+            if (!queueAac(currentDecoder, packet)) break   // decoder input full: retry next tick
+            synchronized(stateLock) { if (frameQueue.peekFirst() === packet) frameQueue.pollFirst() }
+            fed++
         }
-        if (packet != null && decoder == null) {
-            decoder = createAacDecoder()
+        decoder?.let { drainAac(it) }
+        // Unless this is an ALAC session, service the track even when no audio is waiting (keep-alive silence).
+        if (currentTrack.playState == AudioTrack.PLAYSTATE_PLAYING && (!sawPcm || pendingPcm.isNotEmpty())) {
+            writePendingAac(currentTrack)
         }
-        val currentDecoder = decoder ?: return
+    }
 
-        // 1. Submit input frame if available
-        if (packet != null) {
-            try {
-                val inputIndex = currentDecoder.dequeueInputBuffer(0)
-                if (inputIndex >= 0) {
-                    val inputBuffer = currentDecoder.getInputBuffer(inputIndex)
-                    if (inputBuffer != null) {
-                        inputBuffer.clear()
-                        inputBuffer.put(packet.data)
-                        currentDecoder.queueInputBuffer(
-                            inputIndex,
-                            0,
-                            packet.data.size,
-                            packet.ntpTimestamp / 1000,
-                            0
-                        )
-                    }
-                } else {
-                    // Put back if decoder input full
-                    synchronized(stateLock) {
-                        if (active && !closed) frameQueue.addFirst(packet)
-                    }
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Error queueing audio frame: ${e.javaClass.simpleName}: ${e.message}")
-            }
+    /** Submits one AAC packet; false when the decoder has no free input buffer. */
+    private fun queueAac(codec: MediaCodec, packet: AudioPacket): Boolean {
+        try {
+            val inputIndex = codec.dequeueInputBuffer(0)
+            if (inputIndex < 0) return false
+            val inputBuffer = codec.getInputBuffer(inputIndex) ?: return true
+            inputBuffer.clear()
+            inputBuffer.put(packet.data)
+            // The presentation timestamp (CLOCK_REALTIME ns) rides through the decoder in microseconds.
+            codec.queueInputBuffer(inputIndex, 0, packet.data.size, packet.ntpTimestamp / 1000, 0)
+        } catch (e: Exception) {
+            Log.w(TAG, "Error queueing audio frame: ${e.javaClass.simpleName}: ${e.message}")
         }
+        return true
+    }
 
-        // 2. Drain decoded PCM output and write to AudioTrack
+    private fun drainAac(codec: MediaCodec) {
         try {
             var drained = 0
             while (drained < 8) {
-                val outputIndex = currentDecoder.dequeueOutputBuffer(bufferInfo, 0)
+                val outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
                 when {
                     outputIndex >= 0 -> {
-                        val outputBuffer = currentDecoder.getOutputBuffer(outputIndex)
+                        val outputBuffer = codec.getOutputBuffer(outputIndex)
                         if (outputBuffer != null && bufferInfo.size > 0) {
                             outputBuffer.position(bufferInfo.offset)
                             outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
-                            if (pcmBuffer.size < bufferInfo.size) {
-                                pcmBuffer = ByteArray(bufferInfo.size)
-                            }
-                            outputBuffer.get(pcmBuffer, 0, bufferInfo.size)
-                            currentTrack.write(pcmBuffer, 0, bufferInfo.size)
-                            telemetry?.onAudioFramePlayed()
+                            val pcm = ByteArray(bufferInfo.size)
+                            outputBuffer.get(pcm)
+                            if (pendingPcm.size >= MAX_PENDING_CHUNKS) pendingPcm.pollFirst()
+                            pendingPcm.addLast(PcmChunk(pcm, bufferInfo.presentationTimeUs * 1000L))
                         }
-                        currentDecoder.releaseOutputBuffer(outputIndex, false)
+                        codec.releaseOutputBuffer(outputIndex, false)
                         drained++
-                        fedFrames++
-                        if (fedFrames % 500 == 0L) {
-                            Log.i(TAG, "Audio PCM frames played: $fedFrames")
-                        }
                     }
                     outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                        Log.i(TAG, "Audio decoder format changed: ${currentDecoder.outputFormat}")
-                        val rate = currentDecoder.outputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-                        val channels = currentDecoder.outputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                        Log.i(TAG, "Audio decoder format changed: ${codec.outputFormat}")
+                        val rate = codec.outputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                        val channels = codec.outputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
                         telemetry?.onAudioFormatConfigured(codecLabel, rate, channels)
                         break
                     }
@@ -319,6 +384,160 @@ class AudioRenderer(private val telemetry: StreamTelemetry? = null) {
             }
         } catch (e: Exception) {
             Log.w(TAG, "Error draining audio output: ${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
+    /**
+     * Writes decoded AAC and keeps the track running.
+     *
+     * The next frame written is heard when everything queued has played ([AvSync.predictHeardNanos]); a chunk's
+     * error is that moment minus its presentation time.
+     *  - After silence (start of the stream, or after a pause) an early chunk is preceded by exactly the
+     *    silence that puts it on time.
+     *  - Audio that continues other audio is never re-timed with a gap. It waits while the track has enough
+     *    queued, and otherwise it is written and the error is removed by playing slightly faster or slower.
+     *  - Audio more than [AvSync.SKIP_ABOVE_NS] late (stale packets a sender flushes when its audio restarts,
+     *    the backlog after a Wi-Fi stall) is skipped until it is nearly on time.
+     */
+    private fun writePendingAac(track: AudioTrack) {
+        val nowMono = System.nanoTime()
+        val head = track.playbackHeadPosition.toLong() and 0xffffffffL
+        if (head != lastHead) { lastHead = head; headMovedAt = nowMono }
+        val running = nowMono - headMovedAt < TRACK_STALL_NS
+        if (!running) primeTrack(track)
+        val hasTimestamp = running && track.getTimestamp(timestamp) && nowMono - timestamp.nanoTime < TIMESTAMP_MAX_AGE_NS
+        if (hasTimestamp && pcmFramesWritten > head) {
+            val path = AvSync.outputPathNanos(nowMono, head, timestamp.framePosition, timestamp.nanoTime, SAMPLE_RATE)
+            if (path in 0L..AvSync.MAX_AUDIO_OUTPUT_NS) outputPathNs += (path - outputPathNs) / 16
+        }
+        val underruns = runCatching { track.underrunCount }.getOrDefault(lastUnderruns)
+        if (underruns > lastUnderruns && lastQueuedFrames > 0L && pendingPcm.isNotEmpty() && safetyNs < MAX_SAFETY_NS) {
+            // The track ran dry although it had audio and more was waiting: keep more of it queued.
+            safetyNs = minOf(safetyNs + SAFETY_STEP_NS, MAX_SAFETY_NS)
+            Log.i(TAG, "av_sync audio underrun with audio pending; track safety now ${safetyNs / 1_000_000} ms")
+        }
+        lastUnderruns = underruns
+        sync?.setAudioOutputLatency(outputPathNs + safetyNs)
+
+        val realMinusMono = WallClock.realMinusMono()
+        val nowReal = nowMono + realMinusMono
+        val safetyFrames = safetyNs * SAMPLE_RATE / 1_000_000_000L
+        // Keep only a little more than the safety fill in the track: speed changes and skips act sooner.
+        val fillLimit = minOf(trackCapacityFrames, safetyFrames + FILL_ABOVE_SAFETY_FRAMES)
+        var budget = MAX_AAC_WRITES_PER_TICK
+        while (budget-- > 0) {
+            val chunk = pendingPcm.peekFirst() ?: break
+            val chunkFrames = (chunk.data.size / PCM_FRAME_BYTES).toLong()
+            val queued = (pcmFramesWritten - (track.playbackHeadPosition.toLong() and 0xffffffffL)).coerceAtLeast(0L)
+            val presentAt = sync?.audioPresentAt(chunk.ntpReal, nowReal)
+            if (presentAt == null) {
+                // No usable timestamp: play as it arrives, keeping only a little in the track.
+                if (queued > UNSYNCED_FILL_FRAMES) break
+                pendingPcm.pollFirst()
+                writeAac(track, chunk.data, 1.0)
+                while (pendingPcm.size > UNSYNCED_MAX_PENDING) pendingPcm.pollFirst()
+                continue
+            }
+            val heardAt = AvSync.predictHeardNanos(
+                System.nanoTime(), pcmFramesWritten, head,
+                if (hasTimestamp) timestamp.framePosition else null, if (hasTimestamp) timestamp.nanoTime else null,
+                outputPathNs, SAMPLE_RATE
+            ) + realMinusMono
+            val error = heardAt - presentAt
+            if (error > AvSync.SKIP_ABOVE_NS || (skipping && error > AvSync.SKIP_UNTIL_NS)) {
+                if (!skipping) Log.w(TAG, "av_sync skipping audio ${error / 1_000_000} ms late")
+                skipping = true
+                pendingPcm.pollFirst()
+                syncDropped++
+                errorNs = 0L
+                continue
+            }
+            skipping = false
+            if (queued >= safetyFrames && queued + chunkFrames > fillLimit) break   // enough queued for now
+            if (error < -AvSync.AUDIO_EARLY_TOLERANCE_NS) {
+                if (tailIsAudio) {
+                    // Early, continuing other audio: wait while the track has enough, else write and slow down.
+                    if (queued > safetyFrames) break
+                } else {
+                    // Early, after silence: more silence puts it exactly on time.
+                    val gapFrames = -error * SAMPLE_RATE / 1_000_000_000L
+                    val room = trackCapacityFrames - queued - chunkFrames
+                    if (gapFrames > room) {
+                        // Too far ahead to queue yet: keep the track fed and come back.
+                        if (queued < fillLimit) writeSilence(track, minOf(room, fillLimit - queued))
+                        break
+                    }
+                    writeSilence(track, gapFrames)
+                    pendingPcm.pollFirst()
+                    noteWritten(0L, presentAt - chunk.ntpReal, nowReal)
+                    writeAac(track, chunk.data, 1.0)
+                    continue
+                }
+            }
+            pendingPcm.pollFirst()
+            noteWritten(error, heardAt - chunk.ntpReal, nowReal)
+            writeAac(track, chunk.data, speed)
+        }
+
+        lastQueuedFrames = (pcmFramesWritten - (track.playbackHeadPosition.toLong() and 0xffffffffL)).coerceAtLeast(0L)
+        if (pendingPcm.isEmpty() && lastQueuedFrames < safetyFrames) {
+            // No audio waiting: keep the safety fill with silence, so a pause in the sender's audio neither
+            // lets AudioFlinger drop the track (it would then need a full buffer to restart) nor loses its timing.
+            writeSilence(track, safetyFrames - lastQueuedFrames)
+            lastQueuedFrames = safetyFrames
+        }
+        if (nowMono - lastSyncLog >= SYNC_LOG_INTERVAL_NS && (pcmFramesWritten > silenceFrames || pendingPcm.isNotEmpty())) {
+            lastSyncLog = nowMono
+            val fillMs = lastQueuedFrames * 1000 / SAMPLE_RATE
+            val heard = if (heardOffsetCount > 0) "%.1f".format(heardOffsetSum / heardOffsetCount / 1e6) else "-"
+            Log.i(TAG, "av_sync audio heardMinusTs=${heard}ms error=${"%.1f".format(errorNs / 1e6)}ms " +
+                "speed=${"%.3f".format(minSpeed)}..${"%.3f".format(maxSpeed)} fill=${fillMs}ms pending=${pendingPcm.size} " +
+                "outputPath=${outputPathNs / 1_000_000}ms safety=${safetyNs / 1_000_000}ms skipped=$syncDropped " +
+                "silence=${silenceFrames * 1000 / SAMPLE_RATE}ms underruns=$lastUnderruns ${sync?.describe() ?: "no-sync"}")
+            heardOffsetSum = 0L
+            heardOffsetCount = 0
+            minSpeed = speed
+            maxSpeed = speed
+        }
+    }
+
+    /** Records the error of the chunk about to be written and derives the speed for it and the next ones. */
+    private fun noteWritten(error: Long, heardMinusTs: Long, nowReal: Long) {
+        errorNs = if (error == 0L) 0L else errorNs + (error - errorNs) / ERROR_SMOOTHING
+        speed = AvSync.audioSpeed(errorNs)
+        minSpeed = minOf(minSpeed, speed)
+        maxSpeed = maxOf(maxSpeed, speed)
+        sync?.setAudioError(errorNs, nowReal)
+        heardOffsetSum += heardMinusTs
+        heardOffsetCount++
+    }
+
+    private fun writeAac(track: AudioTrack, data: ByteArray, speed: Double) {
+        try {
+            val pcm = stretcher.process(data, speed)
+            val written = track.write(pcm, 0, pcm.size)
+            if (written > 0) {
+                pcmFramesWritten += written / PCM_FRAME_BYTES
+                tailIsAudio = true
+                telemetry?.onAudioFramePlayed()
+                fedFrames++
+                if (fedFrames % 500 == 0L) Log.i(TAG, "Audio PCM frames played: $fedFrames")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error writing PCM: ${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
+    private fun writeSilence(track: AudioTrack, frames: Long) {
+        if (frames <= 0L) return
+        val bytes = (frames * PCM_FRAME_BYTES).toInt()
+        if (silence.size < bytes) silence = ByteArray(bytes)
+        val written = runCatching { track.write(silence, 0, bytes) }.getOrDefault(0)
+        if (written > 0) {
+            pcmFramesWritten += written / PCM_FRAME_BYTES
+            silenceFrames += written / PCM_FRAME_BYTES
+            tailIsAudio = false
+            stretcher.reset()
         }
     }
 
@@ -370,6 +589,25 @@ class AudioRenderer(private val telemetry: StreamTelemetry? = null) {
         const val TAG = "WormholeAudio"
         const val SAMPLE_RATE = 44100
         const val MAX_QUEUE_SIZE = 30
+        const val MAX_AAC_INPUTS_PER_TICK = 4
+        const val MAX_AAC_WRITES_PER_TICK = 16
+        /** ~2.8 s of 480-frame chunks: AAC may arrive well before it is due. */
+        const val MAX_PENDING_CHUNKS = 256
+        /** Without timestamps: keep at most ~100 ms in the track and ~330 ms waiting. */
+        const val UNSYNCED_FILL_FRAMES = SAMPLE_RATE / 10L
+        const val UNSYNCED_MAX_PENDING = 30
+        /** 200 ms of 16-bit stereo at 44.1 kHz. */
+        const val TRACK_CAPACITY_BYTES = SAMPLE_RATE / 5 * 4
+        const val DEFAULT_SAFETY_NS = 40_000_000L
+        const val SAFETY_STEP_NS = 10_000_000L
+        const val MAX_SAFETY_NS = 150_000_000L
+        const val TIMESTAMP_MAX_AGE_NS = 500_000_000L
+        /** The track counts as not playing when its position has not moved for this long (mixer period: 40 ms). */
+        const val TRACK_STALL_NS = 400_000_000L
+        const val SYNC_LOG_INTERVAL_NS = 5_000_000_000L
+        /** ~60 ms of audio kept in the track on top of the safety fill. */
+        const val FILL_ABOVE_SAFETY_FRAMES = SAMPLE_RATE * 6L / 100
+        const val ERROR_SMOOTHING = 8
         /** ~4 s of 352-frame ALAC packets: audio-only senders run about 2 s ahead. */
         const val MAX_PCM_QUEUE_SIZE = 512
         const val MAX_PCM_WRITES_PER_TICK = 16
