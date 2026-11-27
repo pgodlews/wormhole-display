@@ -10,7 +10,7 @@ class PairedClientsTest {
         val original = PairedClient(
             publicKey = "q83vEjRWeJCrze8SNFZ4kKvN7xI0VniQq83vEjRWeJA=",
             deviceId = "AA:BB:CC:DD:EE:FF",
-            name = "Piotr’s MacBook | 100% \nPro"
+            name = "Sam’s MacBook | 100% \nPro"
         )
         assertEquals(original, PairedClient.deserialize(original.serialize()))
     }
