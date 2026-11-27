@@ -158,6 +158,21 @@ pairing_session_check_handshake_status(pairing_session_t *session)
     }
 }
 
+/* Android port: PIN-mode admission helpers (see raop_handler_pairverify / raop_handler_setup) */
+bool
+pairing_session_is_verified(pairing_session_t *session)
+{
+    assert(session);
+    return session->status == STATUS_FINISHED;
+}
+
+bool
+pairing_session_is_setup_key(pairing_session_t *session, const unsigned char ed_key[ED25519_KEY_SIZE])
+{
+    assert(session);
+    return session->pair_setup && !memcmp(session->client_pk, ed_key, ED25519_KEY_SIZE);
+}
+
 int
 pairing_session_handshake(pairing_session_t *session, const unsigned char ecdh_key[X25519_KEY_SIZE],
                           const unsigned char ed_key[ED25519_KEY_SIZE])
