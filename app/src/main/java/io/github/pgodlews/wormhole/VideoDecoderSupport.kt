@@ -21,4 +21,18 @@ internal object VideoDecoderSupport {
                 }.getOrDefault(false)
         }?.let { Hevc(it.name, width, height) }
     }.onFailure { Log.w("Wormhole", "HEVC capability query failed", it) }.getOrNull()
+
+    /** Diagnostics: every AVC/HEVC decoder on the device with its profiles (HEVC 2 = Main10, 4096 = Main10 HDR10). */
+    fun describeDecoders(): List<String> = runCatching {
+        MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter { !it.isEncoder }.flatMap { info ->
+            info.supportedTypes.filter {
+                it.equals(MediaFormat.MIMETYPE_VIDEO_AVC, true) || it.equals(MediaFormat.MIMETYPE_VIDEO_HEVC, true)
+            }.map { type ->
+                val profiles = runCatching {
+                    info.getCapabilitiesForType(type).profileLevels.map { it.profile }.distinct().sorted()
+                }.getOrDefault(emptyList())
+                "${info.name} $type profiles=$profiles"
+            }
+        }
+    }.getOrDefault(emptyList())
 }
