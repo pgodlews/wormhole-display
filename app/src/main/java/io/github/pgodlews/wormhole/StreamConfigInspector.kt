@@ -9,6 +9,11 @@ package io.github.pgodlews.wormhole
  * summary, so a field this parser gets wrong can still be decoded from the log.
  */
 internal class StreamConfigInspector {
+    /**
+     * Off unless the dashboard's debug switch is on. While off nothing is parsed or remembered, so the first
+     * parameter packet after switching on is reported in full.
+     */
+    @Volatile var enabled = false
     private var lastConfig: ByteArray? = null
     private var reports = 0
 
@@ -19,6 +24,10 @@ internal class StreamConfigInspector {
 
     /** Log lines for a packet that carries parameter sets, or null for any other packet. */
     fun inspect(data: ByteArray, codec: VideoCodec): List<String>? {
+        if (!enabled) {
+            if (lastConfig != null) reset()
+            return null
+        }
         val first = payloadStart(data, 0) ?: return null
         if (first >= data.size || !isParameterSet(codec, nalType(codec, data[first]))) return null
 

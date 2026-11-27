@@ -30,6 +30,10 @@ class VideoRenderer(
     private var session = 0L
     private var diagnostics = VideoDiagnostics(session)
     private val streamConfig = StreamConfigInspector()
+    /** Diagnostic logging (the `[diag]` lines); follows the dashboard's debug switch. */
+    var diagnosticsEnabled: Boolean
+        get() = streamConfig.enabled
+        set(value) { streamConfig.enabled = value }
     @Volatile internal var hevcDecoder: VideoDecoderSupport.Hevc? = null
     private val worker = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "Wormhole decoder") }
     // Fields below are confined to worker.
@@ -81,7 +85,8 @@ class VideoRenderer(
         if (active && !closed) {
             sessionHevc = hevc
             val codec = if (hevc) VideoCodec.HEVC else VideoCodec.AVC
-            // Diagnostics only: what the sender's parameter sets say about size and colour. Never affects playback.
+            // Diagnostics only, and only with the debug switch on: what the sender's parameter sets say about size
+            // and colour. Never affects playback.
             runCatching { streamConfig.inspect(data, codec) }.getOrNull()?.forEach { Log.i(TAG, it) }
             val now = System.nanoTime()
             telemetry.onFrameReceived(data.size, now)
@@ -234,7 +239,7 @@ class VideoRenderer(
                 index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                     val format = decoder.outputFormat
                     Log.i(TAG, "decoder format: $format")
-                    runCatching {
+                    if (diagnosticsEnabled) runCatching {
                         Log.i(TAG, "${StreamConfigInspector.PREFIX} decoder-output " +
                             describeOutputColour({ format.containsKey(it) }, { format.getInteger(it) }) {
                                 format.getByteBuffer("hdr-static-info")?.duplicate()?.let { b -> ByteArray(b.remaining()).also(b::get) }

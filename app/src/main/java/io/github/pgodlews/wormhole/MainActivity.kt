@@ -693,7 +693,7 @@ private fun DashboardScreen(
                     HorizontalDivider(color = Color(0xFF1F3146), thickness = 0.5.dp)
                     Spacer(modifier = Modifier.height(dividerSpacing))
 
-                    // Row 2b: Telemetry Overlay (Debug)
+                    // Row 2b: debug switch (stats overlay + diagnostic logging)
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -710,13 +710,13 @@ private fun DashboardScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Telemetry Overlay (Debug)",
+                                text = "Debug Overlay & Diagnostics",
                                 fontSize = if (isTvOrCompact) 12.sp else 15.sp,
                                 fontWeight = FontWeight.Medium,
                                 color = Color(0xFFE2E8F0)
                             )
                             Text(
-                                text = "Display real-time stream stats (FPS, bitrate, resolution, codec) in top-left corner",
+                                text = "Show stream stats (FPS, bitrate, codec) on screen and write stream diagnostics to the device log",
                                 fontSize = if (isTvOrCompact) 10.sp else 12.sp,
                                 color = Color(0xFF94A3B8)
                             )

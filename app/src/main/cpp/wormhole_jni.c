@@ -34,6 +34,7 @@ static jstring g_utf8_charset;
 static raop_t *g_raop;                              /* guarded by g_lock */
 static dnssd_t *g_dnssd;                            /* guarded by g_lock */
 static bool g_allow_hevc;                           /* immutable while server workers run */
+static volatile bool g_diagnostics;                 /* "[diag]" lines; the dashboard's debug switch */
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_key_t g_tls_key;                     /* set on threads this shim attached */
 
@@ -383,13 +384,15 @@ static void cb_on_video_stop(void *cls) {}
 static void cb_on_video_info(void *cls, playback_info_t *info) {}
 static float cb_on_playlist_remove(void *cls) { return 0.0f; }
 
-/* Diagnostics. The sender announces a size with every parameter packet: a change without a reconnect means it
- * switched what it puts on this screen (for example from the mirrored phone screen to a full-screen video). */
+/* Diagnostics, logged only while the debug switch is on. The sender announces a size with every parameter packet:
+ * a change without a reconnect means it switched what it puts on this screen (for example from the mirrored phone
+ * screen to a full-screen video). */
 static void cb_video_report_size(void *cls, float *width_source, float *height_source, float *width, float *height) {
+    if (!g_diagnostics) return;
     LOGI("[diag] sender-size source=%.0fx%.0f encoded=%.0fx%.0f", *width_source, *height_source, *width, *height);
 }
-static void cb_video_pause(void *cls) { LOGI("[diag] sender-video paused"); }
-static void cb_video_resume(void *cls) { LOGI("[diag] sender-video resumed"); }
+static void cb_video_pause(void *cls) { if (g_diagnostics) LOGI("[diag] sender-video paused"); }
+static void cb_video_resume(void *cls) { if (g_diagnostics) LOGI("[diag] sender-video resumed"); }
 
 JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
     g_vm = vm;
@@ -431,6 +434,10 @@ JNIEXPORT void Java_io_github_pgodlews_wormhole_NativeBridge_nativeSetListener(J
     if (g_listener) (*env)->DeleteGlobalRef(env, g_listener);
     g_listener = listener ? (*env)->NewGlobalRef(env, listener) : NULL;
     pthread_mutex_unlock(&g_listener_lock);
+}
+
+JNIEXPORT void Java_io_github_pgodlews_wormhole_NativeBridge_nativeSetDiagnostics(JNIEnv *env, jclass cls, jboolean enabled) {
+    g_diagnostics = enabled == JNI_TRUE;
 }
 
 JNIEXPORT jint Java_io_github_pgodlews_wormhole_NativeBridge_nativeStart(JNIEnv *env, jclass cls,

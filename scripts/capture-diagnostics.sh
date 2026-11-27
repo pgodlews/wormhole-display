@@ -2,6 +2,8 @@
 # Record what is needed to diagnose a picture problem on a device connected over adb.
 # See docs/diagnosing-video.md for the full procedure.
 #
+# First switch on "Debug Overlay & Diagnostics" in the Portal dashboard: the diagnostic lines are off by default.
+#
 #   scripts/capture-diagnostics.sh start          begin recording logcat (do this before connecting the sender)
 #   scripts/capture-diagnostics.sh snap <label>   mark the log, save a screenshot and the compositor state
 #   scripts/capture-diagnostics.sh mark <text>    mark the log only
@@ -61,7 +63,8 @@ case "${1:-}" in
     echo $! > "$out/logcat.pid"
     mark "$out" "capture started"
     echo "Recording to $out"
-    echo "Now start mirroring from the sender, then use '$0 snap <label>' while a problem is on screen."
+    echo "Check that 'Debug Overlay & Diagnostics' is switched on in the Portal dashboard: without it nothing is logged."
+    echo "Then start mirroring from the sender, and use '$0 snap <label>' while a problem is on screen."
     ;;
   mark)
     out="$(capture_dir)"
@@ -97,14 +100,15 @@ case "${1:-}" in
     echo "Filtered log: $out/wormhole.txt ($(wc -l < "$out/wormhole.txt" | tr -d ' ') lines, $diag_lines diagnostic)"
     echo "Archive:      $out.tar.gz"
     if [ "$diag_lines" = 0 ]; then
-      echo "warning: no [diag] lines. Is the diagnostics build installed, and did mirroring start during the capture?" >&2
+      echo "warning: no [diag] lines. Switch on 'Debug Overlay & Diagnostics' in the Portal dashboard, then reconnect" >&2
+      echo "         the sender and capture again. (Builds older than this feature have no such lines at all.)" >&2
     else
       echo "Streams seen:"
       grep -aF "stream-config" "$out/wormhole.txt" | grep -aF "summary:" | sed 's/.*summary: /  /' | sort | uniq -c
     fi
     ;;
   *)
-    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac

@@ -10,6 +10,7 @@ import org.junit.Test
  */
 class StreamConfigInspectorTest {
     private fun bytes(hex: String) = ByteArray(hex.length / 2) { hex.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+    private fun enabledInspector() = StreamConfigInspector().apply { enabled = true }
     private fun annexB(vararg nals: String) = nals.fold(byteArrayOf()) { all, nal -> all + byteArrayOf(0, 0, 0, 1) + bytes(nal) }
 
     @Test fun `H264 full range BT709 portrait stream`() {
@@ -88,7 +89,7 @@ class StreamConfigInspectorTest {
     }
 
     @Test fun `ordinary pictures are not inspected`() {
-        val inspector = StreamConfigInspector()
+        val inspector = enabledInspector()
         assertNull(inspector.inspect(annexB("65888000"), VideoCodec.AVC))
         assertNull(inspector.inspect(annexB("419a00"), VideoCodec.AVC))
         assertNull(inspector.inspect(annexB("2601af"), VideoCodec.HEVC))
@@ -98,7 +99,7 @@ class StreamConfigInspectorTest {
     }
 
     @Test fun `H264 parameter packet reports raw sets once and notes repeats and changes`() {
-        val inspector = StreamConfigInspector()
+        val inspector = enabledInspector()
         val packet = annexB(AVC_FULL_709_SPS, AVC_PPS, "0605ffaa80", "65888000")
 
         val first = inspector.inspect(packet, VideoCodec.AVC)!!
@@ -123,7 +124,7 @@ class StreamConfigInspectorTest {
     }
 
     @Test fun `HEVC parameter packet reports VPS SPS and PPS`() {
-        val lines = StreamConfigInspector().inspect(
+        val lines = enabledInspector().inspect(
             annexB(HEVC_VPS, HEVC_MAIN10_HLG_SPS, HEVC_PPS, "2601af"), VideoCodec.HEVC
         )!!
         assertEquals("[diag] stream-config #1 H.265 first nals=VPS:24,SPS:47,PPS:7,IDR:3 bytes=97", lines[0])
@@ -137,17 +138,36 @@ class StreamConfigInspectorTest {
         val sps = bytes(AVC_FULL_709_SPS)
         val packet = byteArrayOf(0, 0, 1) + sps + byteArrayOf(0, 0, 1) + bytes(AVC_PPS) +
             byteArrayOf(0, 0, 1, 6) + ByteArray(600) { 0x55 } + byteArrayOf(0, 0, 1, 0x65, 1)
-        val lines = StreamConfigInspector().inspect(packet, VideoCodec.AVC)!!
+        val lines = enabledInspector().inspect(packet, VideoCodec.AVC)!!
         assertTrue(lines[0], lines[0].contains("nals=SPS:29,PPS:6,SEI:601,IDR:2 "))
         assertTrue(lines.last(), lines.last().endsWith("…(+89 bytes)"))
     }
 
+    @Test fun `nothing is inspected until diagnostics are switched on`() {
+        val inspector = StreamConfigInspector()
+        val packet = annexB(AVC_FULL_709_SPS, AVC_PPS, "65888000")
+        assertFalse(inspector.enabled)
+        assertNull(inspector.inspect(packet, VideoCodec.AVC))
+
+        inspector.enabled = true
+        assertTrue(inspector.inspect(packet, VideoCodec.AVC)!![0].startsWith("[diag] stream-config #1 H.264 first "))
+        assertTrue(inspector.inspect(packet, VideoCodec.AVC)!![0].contains(" repeated "))
+
+        // Switched off and on again mid-session: the capture starts over with the full description.
+        inspector.enabled = false
+        assertNull(inspector.inspect(packet, VideoCodec.AVC))
+        inspector.enabled = true
+        val again = inspector.inspect(packet, VideoCodec.AVC)!!
+        assertTrue(again[0], again[0].startsWith("[diag] stream-config #1 H.264 first "))
+        assertEquals(4, again.size)
+    }
+
     @Test fun `a packet stuffed with units is examined and logged only up to a fixed number`() {
         val stuffed = annexB(*Array(5000) { AVC_PPS })
-        val lines = StreamConfigInspector().inspect(stuffed, VideoCodec.AVC)!!
+        val lines = enabledInspector().inspect(stuffed, VideoCodec.AVC)!!
         assertTrue(lines[0], lines[0].endsWith(",PPS:6,+more bytes=${stuffed.size}"))
         assertEquals(13, lines.size) // the header and one line for each of the 12 units examined
-        val exact = StreamConfigInspector().inspect(annexB(*Array(12) { AVC_PPS }), VideoCodec.AVC)!!
+        val exact = enabledInspector().inspect(annexB(*Array(12) { AVC_PPS }), VideoCodec.AVC)!!
         assertFalse(exact[0], exact[0].contains("+more"))
     }
 

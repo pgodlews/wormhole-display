@@ -4,27 +4,35 @@ The receiver logs what the sender's video stream says about itself (size, bit de
 transfer function) and how the Portal's decoder interprets it. Together with a screenshot taken while a problem is
 on screen, that is enough to tell whether a wrong-looking picture comes from the sender, the decoder or the display.
 
-Every line added for this purpose carries the marker `[diag]`. They are few (a handful per session and per stream
-change), so they stay on in normal builds.
+Every line added for this purpose carries the marker `[diag]`.
+
+**The diagnostics are off by default.** They are written only while **Debug Overlay & Diagnostics** is switched on in
+the dashboard, the same switch that shows the on-screen stats overlay. With it off, the receiver does not parse the
+stream's parameter sets and writes none of these lines, in release and debug builds alike. The switch is remembered
+across restarts, so turn it off again when you are done.
 
 ## Capturing a session
 
-You need the device on USB with `adb devices` listing it, and the sender on the same Wi-Fi.
+You need the device on USB with `adb devices` listing it, and the sender on the same Wi-Fi. Any build that has this
+feature works, including a release APK: there is nothing to rebuild.
 
 ```bash
 ./scripts/build.sh
 adb install -r dist/wormhole-display.apk      # see "Install fails" below if this is refused
 adb shell am start -n io.github.pgodlews.wormhole/.MainActivity
 
-./scripts/capture-diagnostics.sh start        # 1. before connecting the sender
-#                                               2. start Screen Mirroring on the iPhone, reproduce the problem
-./scripts/capture-diagnostics.sh snap grey    # 3. while a bad picture is on screen
+#                                               1. on the Portal dashboard, switch on "Debug Overlay & Diagnostics"
+./scripts/capture-diagnostics.sh start        # 2. before connecting the sender
+#                                               3. start Screen Mirroring on the iPhone, reproduce the problem
+./scripts/capture-diagnostics.sh snap grey    # 4. while a bad picture is on screen
 ./scripts/capture-diagnostics.sh snap normal  #    and while a good one is, for comparison
-./scripts/capture-diagnostics.sh stop         # 4. writes dist/diagnostics/<timestamp>.tar.gz
+./scripts/capture-diagnostics.sh stop         # 5. writes dist/diagnostics/<timestamp>.tar.gz
+#                                               6. switch "Debug Overlay & Diagnostics" off again
 ```
 
-Start the capture **before** the sender connects: the session-start lines and the first stream description are
-logged once, when mirroring begins.
+Switch the diagnostics on and start the capture **before** the sender connects: the first stream description and
+the decoder's output format are logged when mirroring begins. If a session is already running, switch it on and
+then reconnect the sender. The stats overlay appears in the screenshots; that is expected.
 
 `snap <label>` writes a marker into the device log, saves a screenshot and saves the compositor state
 (`dumpsys SurfaceFlinger`). `mark <text>` writes only the marker; use it to note anything that has no picture, for
@@ -45,7 +53,8 @@ Send the `.tar.gz`. If only text can be passed on, send `wormhole.txt` and say w
 
 ### Grey or washed-out videos, or the phone stops showing the video
 
-1. `start`, then mirror the iPhone and open the app that shows the problem (for example TikTok).
+1. Switch on **Debug Overlay & Diagnostics**, run `start`, then mirror the iPhone and open the app that shows the
+   problem (for example TikTok).
 2. Take `snap normal` on two or three videos that look right.
 3. Take `snap grey` on at least three videos that look wrong, while each is still on screen.
 4. When the phone stops showing a video and it plays only on the Portal, take `snap phone-stopped`. Say whether
@@ -75,7 +84,7 @@ To watch live: `adb logcat -v time Wormhole:V WormholeServer:V WormholeMark:V ux
 
 | Line | Logged | Meaning |
 |---|---|---|
-| `[diag] session-start` | once per mirroring session | App version, device, sender name, advertised size, H.265 setting and decoder. |
+| `[diag] session-start` | once per mirroring session, and when switched on during one | App version, device, sender name, advertised size, H.265 setting and decoder. |
 | `[diag] display` | once per session | HDR types the panel reports (`2` HDR10, `3` HLG), wide colour gamut, display mode. |
 | `[diag] decoder-available` | once per session, per decoder | Every H.264/HEVC decoder with its profiles. For HEVC, `2` is Main10 and `4096` is Main10 HDR10. |
 | `[diag] sender-size` | with every parameter packet | Size the sender announces: `source` is what it is showing, `encoded` is the video size. |

@@ -30,7 +30,7 @@ app/src/main/java/io/github/pgodlews/wormhole/
     NativeBridge.kt                       JNI declarations
     ScreenOrientation.kt                  portrait/landscape/auto orientation modes and model helpers
     VideoFrameQueue.kt, VideoRenderer.kt  compressed-frame queue → MediaCodec → Surface (H.264/HEVC)
-    StreamConfigInspector.kt              diagnostics: parses SPS size/colour from parameter packets into `[diag]` log lines
+    StreamConfigInspector.kt              diagnostics (debug switch only): SPS size/colour from parameter packets → `[diag]` log lines
     AudioRenderer.kt                      AAC-ELD decode → AudioTrack
     NowPlaying.kt                         track metadata + extrapolated position for audio-only sessions
     WormholeIdentity.kt                   persisted deviceid, service name, Wi-Fi multicast lock
@@ -112,10 +112,15 @@ Logs on the device:
 adb logcat | grep -E "uxplay|Wormhole|AndroidRuntime|libc"
 ```
 
-Picture looks wrong (colour, washed-out video, unexpected size changes): record a session with
-`scripts/capture-diagnostics.sh` and read `docs/diagnosing-video.md`. Lines marked `[diag]` describe the sender's
-parameter sets (bit depth, colour range, primaries, transfer), the decoder's output format and the display's HDR
-capabilities. Keep that marker on any diagnostic line you add; the capture script and the docs rely on it.
+Picture looks wrong (colour, washed-out video, unexpected size changes): switch on **Debug Overlay & Diagnostics**
+in the dashboard, record a session with `scripts/capture-diagnostics.sh` and read `docs/diagnosing-video.md`. Lines
+marked `[diag]` describe the sender's parameter sets (bit depth, colour range, primaries, transfer), the decoder's
+output format and the display's HDR capabilities.
+
+Diagnostic logging is **off by default and must stay that way**: it parses sender-controlled bytes and is of no use
+to end users. Everything marked `[diag]` is gated on that one switch (`WormholeServer.debugOverlayEnabled` →
+`VideoRenderer.diagnosticsEnabled` in Kotlin, `nativeSetDiagnostics` → `g_diagnostics` in the JNI shim). Gate any
+diagnostic line you add the same way and keep the marker; the capture script and the docs rely on it.
 
 ## Troubleshooting — every one of these was hit for real
 

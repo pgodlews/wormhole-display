@@ -165,6 +165,7 @@ object WormholeServer {
         startOnBoot = prefs.getBoolean("start_on_boot", true)
 
         audioRenderer.audioEnabled = audioEnabled
+        renderer.diagnosticsEnabled = debugOverlayEnabled
 
         val autoSupported = WormholeIdentity.hasOrientationSensor(appContext)
         val defaultOrientation = ScreenOrientation.LANDSCAPE
@@ -190,9 +191,20 @@ object WormholeServer {
         prefs.edit().putBoolean("audio_enabled", enabled).apply()
     }
 
+    /** The debug switch: the on-screen stats overlay and the `[diag]` log lines (docs/diagnosing-video.md). */
     fun setDebugOverlayEnabled(enabled: Boolean) {
         debugOverlayEnabled = enabled
         prefs.edit().putBoolean("debug_overlay_enabled", enabled).apply()
+        renderer.diagnosticsEnabled = enabled
+        setNativeDiagnostics(enabled)
+        // Switched on during a session: the once-per-session lines would otherwise be missing from the capture.
+        if (enabled && _isMirroring.value) Thread({ logSessionDiagnostics() }, "Wormhole diagnostics").start()
+    }
+
+    /** Never fatal: diagnostics must not be able to stop the receiver. */
+    private fun setNativeDiagnostics(enabled: Boolean) {
+        runCatching { NativeBridge.nativeSetDiagnostics(enabled) }
+            .onFailure { Log.w(TAG, "could not switch native diagnostics", it) }
     }
 
     fun setHevcEnabled(enabled: Boolean) {
@@ -291,6 +303,7 @@ object WormholeServer {
                 identity.holdMulticastLock()
                 callbacksEnabled.set(true)
                 NativeBridge.nativeSetListener(listener)
+                setNativeDiagnostics(debugOverlayEnabled)
                 renderer.hevcDecoder = if (requestHevc && !hevcFailedThisProcess.get()) VideoDecoderSupport.findHevc(
                     currentDisplay.width, currentDisplay.height, currentDisplay.refreshRate
                 ) else null
@@ -534,7 +547,7 @@ object WormholeServer {
                 renderer.beginSession()
                 audioRenderer.beginSession()
                 // Off this thread: it delivers the stream, and enumerating decoders can take a while.
-                Thread({ logSessionDiagnostics() }, "Wormhole diagnostics").start()
+                if (debugOverlayEnabled) Thread({ logSessionDiagnostics() }, "Wormhole diagnostics").start()
             } else {
                 recordSessionEnd()
                 renderer.endSession()
@@ -561,8 +574,8 @@ object WormholeServer {
     }
 
     /**
-     * Diagnostics, once per mirroring session so a capture started at any time contains them: what this build and
-     * device are, what was advertised, and what the panel and decoders can do with HDR or wide-gamut video.
+     * Diagnostics, with the debug switch on: once per mirroring session, what this build and device are, what was
+     * advertised, and what the panel and decoders can do with HDR or wide-gamut video.
      */
     private fun logSessionDiagnostics() {
         runCatching {
