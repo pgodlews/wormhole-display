@@ -64,4 +64,46 @@ class VideoRendererTest {
         assertEquals(0, w)
         assertEquals(0, h)
     }
+
+    @Test
+    fun `describeOutputColour names the decoder colour constants`() {
+        val hlg = mapOf(
+            "width" to 1920, "height" to 1080,
+            "color-standard" to 6, "color-range" to 2, "color-transfer" to 7, "hdr-static-info" to 0
+        )
+        assertEquals(
+            "size=1920x1080 color-standard=6(BT.2020) color-range=2(limited) color-transfer=7(HLG) hdr-static-info=present",
+            VideoRenderer.describeOutputColour({ hlg.containsKey(it) }, { hlg[it] ?: 0 })
+        )
+        assertEquals(
+            "size=1920x1080 color-standard=6(BT.2020) color-range=2(limited) color-transfer=7(HLG) hdr-static-info=0001ff",
+            VideoRenderer.describeOutputColour({ hlg.containsKey(it) }, { hlg[it] ?: 0 }) { byteArrayOf(0, 1, -1) }
+        )
+    }
+
+    @Test
+    fun `describeOutputColour names sRGB and tells empty HDR info from real HDR info`() {
+        // What a Portal+ decoder reported for an 8-bit sRGB mirror stream.
+        val sdr = mapOf(
+            "width" to 664, "height" to 1440,
+            "color-standard" to 1, "color-range" to 1, "color-transfer" to 2, "hdr-static-info" to 0
+        )
+        assertEquals(
+            "size=664x1440 color-standard=1(BT.709) color-range=1(full) color-transfer=2(sRGB) hdr-static-info=all-zero(25 bytes)",
+            VideoRenderer.describeOutputColour({ sdr.containsKey(it) }, { sdr[it] ?: 0 }) { ByteArray(25) }
+        )
+        assertEquals(
+            "size=664x1440 color-standard=1(BT.709) color-range=1(full) color-transfer=2(sRGB) hdr-static-info=present",
+            VideoRenderer.describeOutputColour({ sdr.containsKey(it) }, { sdr[it] ?: 0 }) { throw IllegalStateException() }
+        )
+    }
+
+    @Test
+    fun `describeOutputColour reports keys the decoder left unset`() {
+        val bare = mapOf("width" to 886, "height" to 1920, "color-range" to 1)
+        assertEquals(
+            "size=886x1920 color-standard=unset color-range=1(full) color-transfer=unset hdr-static-info=absent",
+            VideoRenderer.describeOutputColour({ bare.containsKey(it) }, { bare[it] ?: 0 })
+        )
+    }
 }

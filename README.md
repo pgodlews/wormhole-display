@@ -42,6 +42,7 @@ Wormhole Display is an independent community project and is not affiliated with 
 - **Several Portals, one network**: each device has its own identity, so a Portal+ and a Portal TV can both be available at once.
 - **Remote-friendly on Portal TV**: full D-pad navigation with clear focus highlights.
 - **Dashboard and stats**: network details, recommended resolutions, recent connections, and an optional on-screen stats overlay (FPS, bitrate, codec).
+- **Diagnostics on request**: the same *Debug Overlay & Diagnostics* switch also writes stream diagnostics to the device log for troubleshooting picture problems. It is off by default; see [Troubleshooting picture problems](#troubleshooting-picture-problems).
 
 ---
 
@@ -123,6 +124,22 @@ adb shell am start -n io.github.pgodlews.wormhole/.MainActivity
 ```
 
 Protocol details, contributor notes and troubleshooting are in [AGENTS.md](AGENTS.md) and [docs/architecture.md](docs/architecture.md).
+
+---
+
+## Troubleshooting picture problems
+
+If the picture looks wrong (washed-out or grey video, wrong colours, unexpected size changes), the receiver can record what the sender's stream says about itself and how the Portal decodes it.
+
+This logging is **off by default**. It runs only while **Debug Overlay & Diagnostics** is switched on in the dashboard, which also shows the on-screen stats overlay. With the switch off, the app does none of this work and writes none of these lines. Nothing is sent anywhere: the lines go to the Portal's own log and can only be read over ADB.
+
+1. On the Portal dashboard, switch on **Debug Overlay & Diagnostics**.
+2. With the Portal connected over USB, run `./scripts/capture-diagnostics.sh start`.
+3. Start mirroring and reproduce the problem. While it is on screen, run `./scripts/capture-diagnostics.sh snap <label>` (for example `snap grey`), and once more on a picture that looks right.
+4. Run `./scripts/capture-diagnostics.sh stop`. The log, screenshots and an archive are written to `dist/diagnostics/`.
+5. Switch **Debug Overlay & Diagnostics** off again.
+
+The diagnostic lines are marked `[diag]`. [docs/diagnosing-video.md](docs/diagnosing-video.md) explains the full procedure and how to read them.
 
 ---
 

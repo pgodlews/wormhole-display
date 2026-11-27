@@ -16,9 +16,12 @@ class VideoRenderer(
     private val onVideoSizeChanged: (width: Int, height: Int) -> Unit = { _, _ -> },
     val telemetry: StreamTelemetry = StreamTelemetry()
 ) {
-    // Some devices take ~500 ms to create the surface/decoder. The 12-frame steady
-    // budget alone can discard the startup IDR before the first codec submission.
-    private val input = VideoFrameQueue(startupMaxFrames = 60)
+    // Some devices take ~500 ms to create the surface/decoder. The steady budget
+    // alone can discard the startup IDR before the first codec submission.
+    // The queue's 12-frame default is ~0.2 s at 60 fps. A short decoder hiccup (observed when the sender restarts its audio
+    // stream and an AAC decoder is created next to the video decoder) overflowed it, which discards the decoder and then
+    // waits for a keyframe the sender may not send for seconds. 48 frames absorb such a hiccup.
+    private val input = VideoFrameQueue(maxFrames = STEADY_QUEUE_FRAMES, startupMaxFrames = 60)
     private val stateLock = Any()
     private var surface: Surface? = null
     private var active = false
@@ -26,6 +29,11 @@ class VideoRenderer(
     private var sessionHevc = false
     private var session = 0L
     private var diagnostics = VideoDiagnostics(session)
+    private val streamConfig = StreamConfigInspector()
+    /** Diagnostic logging (the `[diag]` lines); follows the dashboard's debug switch. */
+    var diagnosticsEnabled: Boolean
+        get() = streamConfig.enabled
+        set(value) { streamConfig.enabled = value }
     @Volatile internal var hevcDecoder: VideoDecoderSupport.Hevc? = null
     private val worker = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "Wormhole decoder") }
     // Fields below are confined to worker.
@@ -55,6 +63,7 @@ class VideoRenderer(
             input.reset()
             input.resetStatistics()
             diagnostics = VideoDiagnostics(session)
+            streamConfig.reset()
             telemetry.reset()
         }
     }
@@ -75,9 +84,13 @@ class VideoRenderer(
     fun onFrame(data: ByteArray, ingressNanos: Long, ntpLocalNanos: Long, ntpRemoteNanos: Long, hevc: Boolean = false) = synchronized(stateLock) {
         if (active && !closed) {
             sessionHevc = hevc
+            val codec = if (hevc) VideoCodec.HEVC else VideoCodec.AVC
+            // Diagnostics only, and only with the debug switch on: what the sender's parameter sets say about size
+            // and colour. Never affects playback.
+            runCatching { streamConfig.inspect(data, codec) }.getOrNull()?.forEach { Log.i(TAG, it) }
             val now = System.nanoTime()
             telemetry.onFrameReceived(data.size, now)
-            input.offer(data, now, ntpLocalNanos, ntpRemoteNanos, ingressNanos, if (hevc) VideoCodec.HEVC else VideoCodec.AVC)
+            input.offer(data, now, ntpLocalNanos, ntpRemoteNanos, ingressNanos, codec)
             // Includes JNI allocation/copy, listener dispatch and queue bookkeeping;
             // excludes the few JNI cleanup instructions after Kotlin returns.
             diagnostics.received(data.size, ingressNanos, ntpLocalNanos, ntpRemoteNanos, System.nanoTime())
@@ -119,7 +132,7 @@ class VideoRenderer(
             decoderPump.tick(generation) {
                 if (now >= nextCreateAttempt) createDecoder(target, snapshot.diagnostics) else null
             }
-            if (input.stalled(now, 2_000_000_000L)) requestReconnect(snapshot.session)
+            if (input.stalled(now, STALL_TIMEOUT_NANOS)) requestReconnect(snapshot.session)
         } catch (e: Exception) {
             Log.w(TAG, "decoder failed; reconnect required: ${e.message}")
             decoderPump.close()
@@ -226,6 +239,12 @@ class VideoRenderer(
                 index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                     val format = decoder.outputFormat
                     Log.i(TAG, "decoder format: $format")
+                    if (diagnosticsEnabled) runCatching {
+                        Log.i(TAG, "${StreamConfigInspector.PREFIX} decoder-output " +
+                            describeOutputColour({ format.containsKey(it) }, { format.getInteger(it) }) {
+                                format.getByteBuffer("hdr-static-info")?.duplicate()?.let { b -> ByteArray(b.remaining()).also(b::get) }
+                            })
+                    }
                     val (w, h) = parseVideoDimensions(format)
                     if (w > 0 && h > 0 && (w != lastWidth || h != lastHeight)) {
                         lastWidth = w
@@ -242,6 +261,12 @@ class VideoRenderer(
 
     internal companion object {
         const val TAG = "Wormhole"
+        const val STEADY_QUEUE_FRAMES = 48
+        /**
+         * How long the queue may wait for a keyframe after a reset, or hold its oldest frame while the decoder
+         * accepts nothing, before the session is given up. A hung decoder therefore freezes the picture this long.
+         */
+        const val STALL_TIMEOUT_NANOS = 5_000_000_000L
 
         fun parseDimensions(hasKey: (String) -> Boolean, getInt: (String) -> Int): Pair<Int, Int> {
             val hasCrop = hasKey("crop-left") && hasKey("crop-right") &&
@@ -262,6 +287,47 @@ class VideoRenderer(
             } else 0
 
             return Pair(width, height)
+        }
+
+        /**
+         * Size and colour interpretation the decoder reports for its output. The values are the platform's
+         * (stagefright ColorUtils), a superset of the MediaFormat constants: decoders report sRGB as transfer 2,
+         * which the SDK does not name. Some decoders attach HDR static info to every stream, so it only means
+         * HDR when it is not all zero.
+         */
+        fun describeOutputColour(
+            hasKey: (String) -> Boolean, getInt: (String) -> Int, hdrStaticInfo: () -> ByteArray? = { null }
+        ): String {
+            fun named(key: String, name: (Int) -> String): String {
+                if (!hasKey(key)) return "$key=unset"
+                val value = runCatching { getInt(key) }.getOrNull() ?: return "$key=unreadable"
+                return "$key=$value(${name(value)})"
+            }
+            val (width, height) = parseDimensions(hasKey, getInt)
+            return "size=${width}x$height " +
+                named("color-standard") {
+                    when (it) {
+                        0 -> "unspecified"; 1 -> "BT.709"; 2, 3 -> "BT.601-625"; 4, 5 -> "BT.601-525"
+                        6, 7 -> "BT.2020"; 8 -> "BT.470M"; 9 -> "film"; 10 -> "DCI-P3"; else -> "?"
+                    }
+                } + " " +
+                named("color-range") { when (it) { 0 -> "unspecified"; 1 -> "full"; 2 -> "limited"; else -> "?" } } + " " +
+                named("color-transfer") {
+                    when (it) {
+                        0 -> "unspecified"; 1 -> "linear"; 2 -> "sRGB"; 3 -> "SDR-video"; 4 -> "gamma2.2"
+                        5 -> "gamma2.8"; 6 -> "PQ"; 7 -> "HLG"; 8 -> "gamma2.6"; else -> "?"
+                    }
+                } + " hdr-static-info=" + when {
+                    !hasKey("hdr-static-info") -> "absent"
+                    else -> {
+                        val info = runCatching(hdrStaticInfo).getOrNull()
+                        when {
+                            info == null -> "present"
+                            info.all { it.toInt() == 0 } -> "all-zero(${info.size} bytes)"
+                            else -> info.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+                        }
+                    }
+                }
         }
 
         fun parseVideoDimensions(format: MediaFormat): Pair<Int, Int> {

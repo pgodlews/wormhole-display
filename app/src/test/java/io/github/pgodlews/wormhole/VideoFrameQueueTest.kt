@@ -138,6 +138,36 @@ class VideoFrameQueueTest {
         assertEquals(1L, bytes.stats(2).overflowDiscarded)
     }
 
+    @Test fun `renderer queue absorbs a decoder hiccup of under a second at 60 fps`() {
+        val frame = 16_666_667L
+        val q = VideoFrameQueue(maxFrames = VideoRenderer.STEADY_QUEUE_FRAMES, startupMaxFrames = 60)
+        q.offer(config + nal(5), 0)
+        q.consumed(q.peek()!!) // past startup: the steady limit applies
+        val generation = q.currentGeneration()
+        // The decoder accepts nothing for 0.5 s. A 12-frame queue was reset after 0.2 s.
+        for (i in 1..30) q.offer(nal(1), i * frame)
+        assertEquals(generation, q.currentGeneration())
+        assertEquals(0L, q.stats(0).overflowEvents)
+        assertFalse(q.stalled(30 * frame, VideoRenderer.STALL_TIMEOUT_NANOS))
+        // Beyond the steady budget the chain is discarded as before.
+        for (i in 31..VideoRenderer.STEADY_QUEUE_FRAMES) q.offer(nal(1), i * frame)
+        assertEquals(generation, q.currentGeneration())
+        q.offer(nal(1), (VideoRenderer.STEADY_QUEUE_FRAMES + 1) * frame)
+        assertNotEquals(generation, q.currentGeneration())
+        assertEquals(1L, q.stats(0).overflowEvents)
+    }
+
+    @Test fun `renderer waits longer than two seconds for a keyframe after overflow`() {
+        val second = 1_000_000_000L
+        val q = VideoFrameQueue(maxFrames = 2)
+        q.offer(config + nal(5), 0); q.offer(nal(1), 1); q.offer(nal(1), 2) // overflow at t = 2 ns
+        assertNull(q.peek())
+        assertFalse(q.stalled(3 * second, VideoRenderer.STALL_TIMEOUT_NANOS))
+        q.offer(nal(5), 3 * second)
+        assertNotNull(q.peek())
+        assertFalse(q.stalled(3 * second, VideoRenderer.STALL_TIMEOUT_NANOS))
+    }
+
     @Test fun `reset restores startup allowance without accepting stale completion`() {
         val q = VideoFrameQueue(maxFrames = 2, startupMaxFrames = 6)
         q.offer(config + nal(5), 0)

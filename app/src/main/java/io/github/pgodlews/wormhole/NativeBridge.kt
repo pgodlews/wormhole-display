@@ -61,6 +61,9 @@ object NativeBridge {
 
     external fun nativeSetListener(listener: Listener?)
 
+    /** Turns the shim's `[diag]` log lines on or off; takes effect at once and outlives server restarts. */
+    external fun nativeSetDiagnostics(enabled: Boolean)
+
     /**
      * Starts the AirPlay server; returns the RTSP port (7000) or a negative error.
      * [requirePin] advertises pw=true and admits only senders that pair with an on-screen PIN.
