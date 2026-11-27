@@ -92,4 +92,19 @@ class DecoderPumpTest {
         assertNull(startupQueue.peek())
     }
 
+
+    @Test fun `a frame that is not yet due is held after the decoder is created`() {
+        val codec = FakeDecoder()
+        var due = false
+        var created = 0
+        queue.offer(first, 0)
+        assertFalse(pump.tick(ready = { due }) { created++; codec })
+        assertEquals("decoder is created while the frame waits", 1, created)
+        assertTrue(codec.submitted.isEmpty())
+        assertNotNull(queue.peek())
+        due = true
+        assertTrue(pump.tick(ready = { due }) { fail("must not recreate codec"); null })
+        assertEquals(1, codec.submitted.size)
+        assertNull(queue.peek())
+    }
 }

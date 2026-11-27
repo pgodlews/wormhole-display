@@ -31,7 +31,8 @@ app/src/main/java/io/github/pgodlews/wormhole/
     ScreenOrientation.kt                  portrait/landscape/auto orientation modes and model helpers
     VideoFrameQueue.kt, VideoRenderer.kt  compressed-frame queue → MediaCodec → Surface (H.264/HEVC)
     StreamConfigInspector.kt              diagnostics (debug switch only): SPS size/colour from parameter packets → `[diag]` log lines
-    AudioRenderer.kt                      AAC-ELD decode → AudioTrack
+    AudioRenderer.kt                      AAC-ELD decode → AudioTrack, timed by AvSync
+    AvSync.kt                             shared audio/video presentation clock (lip sync) over the sender's timestamps
     NowPlaying.kt                         track metadata + extrapolated position for audio-only sessions
     WormholeIdentity.kt                   persisted deviceid, service name, Wi-Fi multicast lock
     PairedClients.kt                      senders paired via the optional on-screen PIN
@@ -160,6 +161,14 @@ diagnostic line you add the same way and keep the marker; the capture script and
   PCM (`ct=0`) before the JNI hop. The negotiated codec/lifetime reach Kotlin via
   the `audio_running(bool, ct)` callback. Dropping audio frames is protocol-safe
   (the core handles resends).
+- **Lip sync**: `AvSync` presents AAC audio and video at the core's `ntp_time_local`
+  plus one shared latency (see "Audio/video sync" in `docs/architecture.md`). A streaming
+  `AudioTrack` only (re)starts once its buffer is full, so `AudioRenderer` keeps it
+  running on silence for the whole session; never let it run dry and never re-time
+  audio with a gap. Corrections are made by playing up to 3 % faster or slower. On
+  Portal+ the speaker path adds ~125 ms below the track and audio packets arrive
+  ~170 ms before their timestamps; check a change against the `av_sync` log lines
+  (`heardMinusTs` and `shownMinusTs` should match) and `dumpsys media.audio_flinger`.
 - **Now playing**: DMAP metadata, cover art and progress reach Kotlin through
   `onNowPlaying` / `onCoverArt` / `onProgress` (see `docs/architecture.md`). Never pass
   sender text to `NewStringUTF`: build strings with `utf8_jstring` (CheckJNI aborts
