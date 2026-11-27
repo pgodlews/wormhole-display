@@ -248,6 +248,20 @@ raop_handler_info(raop_conn_t *conn,
     http_response_add_header(response, "Content-Type", "application/x-apple-binary-plist");
 }
 
+/* Android port: how long, and for how many tries, a displayed random PIN stays valid. iOS lets the
+ * user retype a wrong code in the same prompt and sends pair-setup-pin again without a new
+ * /pair-pin-start, so a PIN used up by its first attempt refused every retry, even the right code.
+ * The window matches the app's on-screen code (hidden after 60 s). */
+#define PIN_MAX_ATTEMPTS 3
+#define PIN_VALID_NS (60ULL * SECOND_IN_NSECS)
+
+static uint64_t
+pin_monotonic_ns(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t) now.tv_sec * SECOND_IN_NSECS + (uint64_t) now.tv_nsec;
+}
+
 static void
 raop_handler_pairpinstart(raop_conn_t *conn,
                           http_request_t *request, http_response_t *response,
@@ -263,6 +277,8 @@ raop_handler_pairpinstart(raop_conn_t *conn,
             logger_log(raop->logger, LOGGER_ERR, "Failed to generate random pin");
         } else {
             raop->pin = (unsigned short) pin_4 % 10000;
+            raop->pin_attempts = 0;
+            raop->pin_shown_ns = pin_monotonic_ns();
         }
     }
     char pin[6] = { '\0' };
@@ -332,12 +348,23 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
             plist_free(req_root_node);
             goto authentication_failed;
         }
+        if (raop->pin < 10000) {
+            uint64_t age_ns = pin_monotonic_ns() - raop->pin_shown_ns;
+            if (raop->pin_attempts >= PIN_MAX_ATTEMPTS || age_ns > PIN_VALID_NS) {
+                logger_log(raop->logger, LOGGER_ERR,
+                           "pair-setup-pin: displayed PIN expired (%d attempts, %llu s); the sender must start again",
+                           (int) raop->pin_attempts, (unsigned long long) (age_ns / SECOND_IN_NSECS));
+                raop->pin = 0;
+                plist_free(req_root_node);
+                goto authentication_failed;
+            }
+            raop->pin_attempts++;
+            logger_log(raop->logger, LOGGER_INFO, "pair-setup-pin: attempt %d of %d with the displayed PIN",
+                       (int) raop->pin_attempts, PIN_MAX_ATTEMPTS);
+        }
         plist_get_string_val(req_user_node, &user);
         logger_log(raop->logger, LOGGER_INFO, "pair-setup-pin:  device_id = %s", user);
         snprintf(pin, 6, "%04u", raop->pin % 10000);
-        if (raop->pin < 10000) {
-            raop->pin = 0;
-        }
         int ret = srp_new_user(conn->session, raop->pairing, (const char *) user,
                                (const char *) pin, &salt, &len_salt, &pk, &len_pk);
         plist_mem_free(user);
@@ -424,6 +451,10 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
             goto authentication_failed;
         } else {
             logger_log(raop->logger, LOGGER_DEBUG, "pair-pin-setup success\n");
+        }
+        /* Android port: a random PIN is used up once a sender has paired with it. */
+        if (raop->pin < 10000) {
+            raop->pin = 0;
         }
         pairing_session_set_setup_status(conn->session);
         /* Android port: register the PIN-paired key now rather than only at SETUP, so a sender that
